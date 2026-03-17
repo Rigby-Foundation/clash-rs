@@ -75,6 +75,8 @@ pub enum OutboundProxyProtocol {
     Tuic(OutboundTuic),
     #[serde(rename = "hysteria2")]
     Hysteria2(OutboundHysteria2),
+    #[serde(rename = "rigby")]
+    Rigby(OutboundRigby),
     #[serde(rename = "ssh")]
     #[cfg(feature = "ssh")]
     Ssh(OutboundSsh),
@@ -103,6 +105,7 @@ impl OutboundProxyProtocol {
             #[cfg(feature = "tuic")]
             OutboundProxyProtocol::Tuic(tuic) => &tuic.common_opts.name,
             OutboundProxyProtocol::Hysteria2(hysteria2) => &hysteria2.name,
+            OutboundProxyProtocol::Rigby(rigby) => &rigby.common_opts.name,
             #[cfg(feature = "ssh")]
             OutboundProxyProtocol::Ssh(ssh) => &ssh.common_opts.name,
             #[cfg(feature = "shadowquic")]
@@ -145,6 +148,7 @@ impl Display for OutboundProxyProtocol {
             #[cfg(feature = "tuic")]
             OutboundProxyProtocol::Tuic(_) => write!(f, "Tuic"),
             OutboundProxyProtocol::Hysteria2(_) => write!(f, "Hysteria2"),
+            OutboundProxyProtocol::Rigby(_) => write!(f, "Rigby"),
             #[cfg(feature = "ssh")]
             OutboundProxyProtocol::Ssh(_) => write!(f, "Ssh"),
             #[cfg(feature = "shadowquic")]
@@ -264,6 +268,13 @@ pub struct OutboundVmess {
     pub grpc_opts: Option<GrpcOpt>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct RealityOpt {
+    pub public_key: String,
+    pub short_id: String,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundVless {
@@ -279,6 +290,25 @@ pub struct OutboundVless {
     pub ws_opts: Option<WsOpt>,
     pub h2_opts: Option<H2Opt>,
     pub grpc_opts: Option<GrpcOpt>,
+    pub reality_opts: Option<RealityOpt>,
+    pub flow: Option<String>,
+    pub client_fingerprint: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundRigby {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub server_static_pubkey: String,
+    pub client_private_key: Option<String>,
+    pub sni: Option<String>,
+    #[serde(default = "default_bool_true")]
+    pub padding: bool,
+    #[serde(default = "default_bool_true")]
+    pub mux: bool,
+    #[serde(default = "default_bool_true")]
+    pub udp: bool,
 }
 
 #[cfg(feature = "wireguard")]
