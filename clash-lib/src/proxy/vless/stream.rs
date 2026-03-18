@@ -4,53 +4,24 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::{sleep, Duration, Sleep};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error};
 
-use crate::{
-    proxy::{AnyStream, transport::switch_reality_raw_modes},
-    session::SocksAddr,
-};
+use crate::{proxy::AnyStream, session::SocksAddr};
 
 const VLESS_VERSION: u8 = 0;
 const VLESS_COMMAND_TCP: u8 = 1;
 const VLESS_COMMAND_UDP: u8 = 2;
-const VLESS_COMMAND_MUX: u8 = 3;
-
-const TLS13_SUPPORTED_VERSIONS: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
-const TLS_CLIENT_HANDSHAKE_START: [u8; 2] = [0x16, 0x03];
-const TLS_SERVER_HANDSHAKE_START: [u8; 3] = [0x16, 0x03, 0x03];
-const TLS_APPLICATION_DATA_START: [u8; 3] = [0x17, 0x03, 0x03];
-
-const COMMAND_PADDING_CONTINUE: u8 = 0x00;
-const COMMAND_PADDING_END: u8 = 0x01;
-const COMMAND_PADDING_DIRECT: u8 = 0x02;
-
-fn build_addon_bytes(flow: &str) -> Vec<u8> {
-    let mut addon = Vec::new();
-    addon.push(0x0A);
-    addon.push(flow.len() as u8);
-    addon.extend_from_slice(flow.as_bytes());
-    addon
-}
 
 pub struct VlessStream {
     inner: AnyStream,
     handshake_done: bool,
     handshake_sent: bool,
     response_received: bool,
-    handshake_pending: Option<BytesMut>,
-    handshake_pending_pos: usize,
-    handshake_ack_len: usize,
-    response_header: [u8; 2],
-    response_header_read: usize,
-    response_additional_remaining: Option<usize>,
     uuid: uuid::Uuid,
     destination: SocksAddr,
     is_udp: bool,
-    xudp: bool,
     flow: Option<String>,
 }
 
@@ -60,538 +31,143 @@ impl VlessStream {
         uuid: &str,
         destination: &SocksAddr,
         is_udp: bool,
-        xudp: bool,
         flow: Option<String>,
     ) -> io::Result<Self> {
         let uuid = uuid::Uuid::parse_str(uuid).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid UUID format")
         })?;
 
+        debug!("VLESS stream created for destination: {}", destination);
+
         Ok(Self {
             inner: stream,
             handshake_done: false,
             handshake_sent: false,
             response_received: false,
-            handshake_pending: None,
-            handshake_pending_pos: 0,
-            handshake_ack_len: 0,
-            response_header: [0u8; 2],
-            response_header_read: 0,
-            response_additional_remaining: None,
             uuid,
             destination: destination.clone(),
             is_udp,
-            xudp,
             flow,
         })
     }
 
     fn build_handshake_header(&self) -> BytesMut {
         let mut buf = BytesMut::new();
+
+        // VLESS request header:
+        // Version (1 byte) + UUID (16 bytes) + Addon length (1 byte)
+        // + Addon bytes (variable) + Command (1 byte) + Port (2 bytes)
+        // + Address type + Address
         buf.put_u8(VLESS_VERSION);
         buf.put_slice(self.uuid.as_bytes());
 
-        if let Some(flow) = &self.flow {
+        if let Some(ref flow) = self.flow {
             let addon = build_addon_bytes(flow);
             buf.put_u8(addon.len() as u8);
-            buf.put_slice(&addon);
+            buf.extend_from_slice(&addon);
         } else {
-            buf.put_u8(0);
+            buf.put_u8(0); // No addon
         }
 
-        let command = if self.xudp {
-            VLESS_COMMAND_MUX
-        } else if self.is_udp {
-            VLESS_COMMAND_UDP
+        if self.is_udp {
+            buf.put_u8(VLESS_COMMAND_UDP);
         } else {
-            VLESS_COMMAND_TCP
-        };
-        buf.put_u8(command);
-
-        if command != VLESS_COMMAND_MUX {
-            self.destination.write_to_buf_vmess(&mut buf);
+            buf.put_u8(VLESS_COMMAND_TCP);
         }
+
+        self.destination.write_to_buf_vmess(&mut buf);
         buf
     }
 
-    fn poll_receive_response(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    async fn send_handshake_with_data(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.handshake_sent {
+            return Ok(0);
+        }
+
+        debug!(
+            "VLESS handshake starting for destination: {}",
+            self.destination
+        );
+
+        let mut buf = self.build_handshake_header();
+        buf.put_slice(data);
+
+        // Send handshake + first data
+        tokio::io::AsyncWriteExt::write_all(&mut self.inner, &buf)
+            .await
+            .map_err(|e| {
+                error!("Failed to send VLESS handshake: {}", e);
+                e
+            })?;
+
+        self.handshake_sent = true;
+        debug!("VLESS handshake sent with {} bytes of data", data.len());
+
+        Ok(data.len())
+    }
+
+    async fn receive_response(&mut self) -> io::Result<()> {
         if self.response_received {
-            return Poll::Ready(Ok(()));
+            return Ok(());
         }
 
-        while self.response_header_read < self.response_header.len() {
-            let mut read_buf = ReadBuf::new(&mut self.response_header[self.response_header_read..]);
-            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
-                Poll::Ready(Ok(())) => {
-                    let n = read_buf.filled().len();
-                    if n == 0 {
-                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "VLESS response eof")));
-                    }
-                    self.response_header_read += n;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+        debug!("VLESS waiting for response");
+
+        // Read response (VLESS response is just version + additional info length +
+        // additional info)
+        let mut response = [0u8; 2];
+        tokio::io::AsyncReadExt::read_exact(&mut self.inner, &mut response)
+            .await
+            .map_err(|e| {
+                error!("Failed to read VLESS response: {}", e);
+                e
+            })?;
+
+        if response[0] != VLESS_VERSION {
+            error!("Invalid VLESS response version: {}", response[0]);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid VLESS response version: {}", response[0]),
+            ));
         }
 
-        if self.response_additional_remaining.is_none() {
-            if self.response_header[0] != VLESS_VERSION {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "invalid VLESS version")));
-            }
-            self.response_additional_remaining = Some(self.response_header[1] as usize);
-        }
+        let additional_info_len = response[1];
 
-        while let Some(remaining) = self.response_additional_remaining {
-            if remaining == 0 {
-                break;
-            }
-            let mut discard = [0u8; 256];
-            let take = remaining.min(discard.len());
-            let mut read_buf = ReadBuf::new(&mut discard[..take]);
-            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
-                Poll::Ready(Ok(())) => {
-                    let n = read_buf.filled().len();
-                    if n == 0 {
-                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "VLESS addons eof")));
-                    }
-                    self.response_additional_remaining = Some(remaining - n);
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+        if additional_info_len > 0 {
+            let mut additional_info = vec![0u8; additional_info_len as usize];
+            tokio::io::AsyncReadExt::read_exact(
+                &mut self.inner,
+                &mut additional_info,
+            )
+            .await
+            .map_err(|e| {
+                error!("Failed to read VLESS additional info: {}", e);
+                e
+            })?;
+            debug!(
+                "VLESS additional info received: {} bytes: {:02x?}",
+                additional_info_len,
+                &additional_info[..additional_info_len.min(32) as usize],
+            );
         }
 
         self.response_received = true;
         self.handshake_done = true;
-        Poll::Ready(Ok(()))
-    }
+        debug!("VLESS handshake completed successfully");
 
-    fn poll_send_handshake(
-        &mut self,
-        cx: &mut Context<'_>,
-        payload: &[u8],
-        ack_len: usize,
-    ) -> Poll<io::Result<usize>> {
-        if self.handshake_sent {
-            return Poll::Ready(Ok(ack_len));
-        }
-
-        if self.handshake_pending.is_none() {
-            let mut handshake = self.build_handshake_header();
-            handshake.extend_from_slice(payload);
-            self.handshake_pending = Some(handshake);
-            self.handshake_pending_pos = 0;
-            self.handshake_ack_len = ack_len;
-        }
-
-        while let Some(pending) = self.handshake_pending.as_ref() {
-            if self.handshake_pending_pos >= pending.len() {
-                break;
-            }
-
-            match Pin::new(&mut self.inner).poll_write(cx, &pending[self.handshake_pending_pos..]) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "VLESS write zero"))),
-                Poll::Ready(Ok(n)) => self.handshake_pending_pos += n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        self.handshake_pending = None;
-        self.handshake_sent = true;
-        let ack = self.handshake_ack_len;
-        self.handshake_ack_len = 0;
-        Poll::Ready(Ok(ack))
+        Ok(())
     }
 }
 
 impl AsyncRead for VlessStream {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // Must receive response before reading
         if self.handshake_sent && !self.response_received {
-            match self.poll_receive_response(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for VlessStream {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, io::Error>> {
-        let vision_flow = matches!(self.flow.as_deref(), Some("xtls-rprx-vision" | "xtls-rprx-vision-udp443"));
-
-        if !self.handshake_sent {
-            let payload = if vision_flow || self.xudp { &[][..] } else { buf };
-            let ack_len = if vision_flow || self.xudp { 0 } else { buf.len() };
-            match self.poll_send_handshake(cx, payload, ack_len) {
-                Poll::Ready(Ok(n)) => {
-                    if (!vision_flow && !self.xudp) || buf.is_empty() {
-                        return Poll::Ready(Ok(n));
-                    }
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum ReadState {
-    Init,
-    Header,
-    Content { cmd: u8, content_len: usize, pad_len: usize },
-    Padding { cmd: u8, pad_len: usize },
-    Raw,
-}
-
-pub struct VisionStream {
-    inner: VlessStream,
-    uuid: [u8; 16],
-    is_tls: bool,
-    number_of_packet_to_filter: i32,
-    is_tls12_or_above: bool,
-    remaining_server_hello: i32,
-    cipher: u16,
-    enable_xtls: bool,
-
-    is_padding: bool,
-    write_uuid: bool,
-    raw_mode_switched: bool,
-
-    read_state: ReadState,
-    read_pending: BytesMut,
-    read_buf: BytesMut,
-    write_pending: Option<WritePending>,
-}
-
-struct WritePending {
-    orig_len: usize,
-    data: BytesMut,
-    pos: usize,
-    switch_to_direct: bool,
-    switch_done: bool,
-    raw_tail: BytesMut,
-    raw_tail_pos: usize,
-    sleep: Option<Pin<Box<Sleep>>>,
-}
-
-impl VisionStream {
-    pub fn new(vless_stream: VlessStream) -> Self {
-        let uuid = *vless_stream.uuid.as_bytes();
-        Self {
-            inner: vless_stream,
-            uuid,
-            is_tls: false,
-            number_of_packet_to_filter: 8,
-            is_tls12_or_above: false,
-            remaining_server_hello: -1,
-            cipher: 0,
-            enable_xtls: false,
-            is_padding: true,
-            write_uuid: true,
-            raw_mode_switched: false,
-            read_state: ReadState::Init,
-            read_pending: BytesMut::new(),
-            read_buf: BytesMut::new(),
-            write_pending: None,
-        }
-    }
-
-    fn filter_tls(&mut self, data: &[u8]) {
-        if self.number_of_packet_to_filter <= 0 || data.len() <= 6 { return; }
-        self.number_of_packet_to_filter -= 1;
-
-        if data.starts_with(&TLS_SERVER_HANDSHAKE_START) && data[5] == 0x02 {
-            self.is_tls = true;
-            self.is_tls12_or_above = true;
-            self.remaining_server_hello = (((data[3] as i32) << 8) | data[4] as i32) + 5;
-            if data.len() >= 79 && self.remaining_server_hello >= 79 {
-                let session_id_len = data[43] as usize;
-                let cipher_index = 43 + session_id_len + 1;
-                if cipher_index + 1 < data.len() {
-                    self.cipher = ((data[cipher_index] as u16) << 8) | data[cipher_index + 1] as u16;
-                }
-            }
-        } else if data.starts_with(&TLS_CLIENT_HANDSHAKE_START) && data[5] == 0x01 {
-            self.is_tls = true;
-        }
-
-        if self.remaining_server_hello > 0 {
-            let end = (self.remaining_server_hello as usize).min(data.len());
-            self.remaining_server_hello -= end as i32;
-            if data[..end].windows(TLS13_SUPPORTED_VERSIONS.len()).any(|w| w == TLS13_SUPPORTED_VERSIONS) {
-                self.enable_xtls = matches!(self.cipher, 0x1301 | 0x1302 | 0x1303 | 0x1304);
-                self.number_of_packet_to_filter = 0;
-            } else if self.remaining_server_hello == 0 {
-                self.number_of_packet_to_filter = 0;
-            }
-        }
-    }
-
-    fn reshape_buffer(data: &[u8]) -> Vec<&[u8]> {
-        const BUFFER_LIMIT: usize = 8192 - 21;
-        if data.len() < BUFFER_LIMIT { return vec![data]; }
-        let split = data.windows(TLS_APPLICATION_DATA_START.len())
-            .rposition(|w| w == TLS_APPLICATION_DATA_START)
-            .filter(|i| *i > 0).unwrap_or(8192 / 2).min(data.len());
-        vec![&data[..split], &data[split..]]
-    }
-
-    fn padding_frame(&mut self, content: &[u8], command: u8) -> BytesMut {
-        let content_len = content.len().min(u16::MAX as usize);
-        let padding_len = if content_len < 900 && self.is_tls {
-            let random = (rand::random::<u16>() % 500) as usize;
-            (900 - content_len).min(u16::MAX as usize - random) + random
-        } else {
-            (rand::random::<u8>() as usize) % 256
-        };
-
-        let mut frame = BytesMut::with_capacity(16 + 5 + content_len + padding_len);
-        if self.write_uuid {
-            frame.extend_from_slice(&self.uuid);
-            self.write_uuid = false;
-        }
-        frame.put_u8(command);
-        frame.put_u16(content_len as u16);
-        frame.put_u16(padding_len as u16);
-        frame.extend_from_slice(&content[..content_len]);
-        if padding_len > 0 {
-            let mut padding = vec![0u8; padding_len];
-            for byte in &mut padding { *byte = rand::random(); }
-            frame.extend_from_slice(&padding);
-        }
-        frame
-    }
-
-    fn make_write_pending(&mut self, data: &[u8]) -> WritePending {
-        if self.number_of_packet_to_filter > 0 {
-            self.filter_tls(data);
-        }
-
-        if !self.is_padding {
-            return WritePending {
-                orig_len: data.len(), data: BytesMut::from(data), pos: 0,
-                switch_to_direct: false, switch_done: false,
-                raw_tail: BytesMut::new(), raw_tail_pos: 0, sleep: None,
-            };
-        }
-
-        let slices = Self::reshape_buffer(data);
-        let mut framed = BytesMut::new();
-        let mut spec_index = None;
-        let mut trigger_raw = false;
-
-        for (i, slice) in slices.iter().enumerate() {
-            if self.is_tls && slice.len() > 6 && slice.starts_with(&TLS_APPLICATION_DATA_START) {
-                self.is_padding = false;
-                // БАГФИКС: Включаем DIRECT и Raw Mode только если XTLS включен
-                let command = if self.enable_xtls {
-                    trigger_raw = true;
-                    COMMAND_PADDING_DIRECT
-                } else {
-                    COMMAND_PADDING_END
-                };
-                framed.extend_from_slice(&self.padding_frame(slice, command));
-                spec_index = Some(i);
-                break;
-            } else if !self.is_tls12_or_above && self.number_of_packet_to_filter <= 1 {
-                self.is_padding = false;
-                // БАГФИКС: Фолбэк для UDP/XUDP. trigger_raw НЕ ВКЛЮЧАЕМ! Остаемся в TLS.
-                framed.extend_from_slice(&self.padding_frame(slice, COMMAND_PADDING_END));
-                spec_index = Some(i);
-                break;
-            }
-            framed.extend_from_slice(&self.padding_frame(slice, COMMAND_PADDING_CONTINUE));
-        }
-
-        let mut raw_tail = BytesMut::new();
-        if let Some(idx) = spec_index {
-            if idx + 1 < slices.len() {
-                for slice in &slices[idx + 1..] { raw_tail.extend_from_slice(slice); }
-            }
-        }
-
-        WritePending {
-            orig_len: data.len(),
-            data: framed,
-            pos: 0,
-            switch_to_direct: trigger_raw, // Флаг для переключения ПОСЛЕ отправки PADDING_END
-            switch_done: false,
-            raw_tail,
-            raw_tail_pos: 0,
-            sleep: None,
-        }
-    }
-
-    fn poll_write_pending(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize, io::Error>> {
-        let pending = self.write_pending.as_mut().unwrap();
-
-        while pending.pos < pending.data.len() {
-            match Pin::new(&mut self.inner).poll_write(cx, &pending.data[pending.pos..]) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "vision write zero"))),
-                Poll::Ready(Ok(n)) => pending.pos += n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        if pending.switch_to_direct && !pending.switch_done {
-            match Pin::new(&mut self.inner).poll_flush(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-            if !self.raw_mode_switched {
-                if let Err(e) = switch_reality_raw_modes(&mut self.inner.inner, false, true) {
-                    warn!("Vision: failed to switch Reality raw write mode: {}", e);
-                }
-                self.raw_mode_switched = true;
-            }
-            pending.switch_done = true;
-            if !pending.raw_tail.is_empty() {
-                pending.sleep = Some(Box::pin(sleep(Duration::from_millis(5))));
-            }
-        }
-
-        if let Some(ref mut sleep_fut) = pending.sleep {
-            match sleep_fut.as_mut().poll(cx) {
-                Poll::Ready(()) => { pending.sleep = None; }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        while pending.raw_tail_pos < pending.raw_tail.len() {
-            match Pin::new(&mut self.inner).poll_write(cx, &pending.raw_tail[pending.raw_tail_pos..]) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "vision tail zero"))),
-                Poll::Ready(Ok(n)) => pending.raw_tail_pos += n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        let ack = pending.orig_len;
-        self.write_pending = None;
-        Poll::Ready(Ok(ack))
-    }
-
-    fn parse_read_pending(&mut self) -> io::Result<bool> {
-        loop {
-            match self.read_state {
-                ReadState::Init => {
-                    if self.read_pending.len() >= 16 {
-                        if self.read_pending[..16] != self.uuid {
-                            self.read_state = ReadState::Raw;
-                            continue;
-                        } else if self.read_pending.len() >= 21 {
-                            self.read_pending.advance(16);
-                            self.read_state = ReadState::Header;
-                            continue;
-                        }
-                    }
-                    return Ok(false);
-                }
-                ReadState::Header => {
-                    if self.read_pending.len() >= 5 {
-                        let cmd = self.read_pending[0];
-                        let content_len = ((self.read_pending[1] as usize) << 8) | self.read_pending[2] as usize;
-                        let pad_len = ((self.read_pending[3] as usize) << 8) | self.read_pending[4] as usize;
-                        self.read_pending.advance(5);
-                        self.read_state = ReadState::Content { cmd, content_len, pad_len };
-                        continue;
-                    }
-                    return Ok(false);
-                }
-                ReadState::Content { cmd, mut content_len, pad_len } => {
-                    if content_len > 0 {
-                        let take = content_len.min(self.read_pending.len());
-                        if take > 0 {
-                            let data = self.read_pending.split_to(take);
-                            if self.number_of_packet_to_filter > 0 {
-                                self.filter_tls(&data);
-                            }
-                            self.read_buf.extend_from_slice(&data);
-                            content_len -= take;
-                            self.read_state = ReadState::Content { cmd, content_len, pad_len };
-                        }
-                        if content_len > 0 {
-                            return Ok(!self.read_buf.is_empty());
-                        }
-                    }
-                    self.read_state = ReadState::Padding { cmd, pad_len };
-                    continue;
-                }
-                ReadState::Padding { cmd, mut pad_len } => {
-                    if pad_len > 0 {
-                        let skip = pad_len.min(self.read_pending.len());
-                        self.read_pending.advance(skip);
-                        pad_len -= skip;
-                        if pad_len > 0 {
-                            self.read_state = ReadState::Padding { cmd, pad_len };
-                            return Ok(!self.read_buf.is_empty());
-                        }
-                    }
-                    if cmd == COMMAND_PADDING_END || cmd == COMMAND_PADDING_DIRECT {
-                        self.read_state = ReadState::Raw;
-                        // БАГФИКС: Отключаем декрипт Reality только для DIRECT!
-                        if cmd == COMMAND_PADDING_DIRECT && !self.raw_mode_switched {
-                            let _ = switch_reality_raw_modes(&mut self.inner.inner, true, true);
-                            self.raw_mode_switched = true;
-                        }
-                    } else {
-                        self.read_state = ReadState::Header;
-                    }
-                    continue;
-                }
-                ReadState::Raw => {
-                    if !self.read_pending.is_empty() {
-                        let data = self.read_pending.split_to(self.read_pending.len());
-                        if self.number_of_packet_to_filter > 0 {
-                            self.filter_tls(&data);
-                        }
-                        self.read_buf.extend_from_slice(&data);
-                        return Ok(true);
-                    }
-                    return Ok(!self.read_buf.is_empty());
-                }
-            }
-        }
-    }
-
-    async fn fill_read_buf(&mut self) -> io::Result<()> {
-        loop {
-            if self.parse_read_pending()? {
-                return Ok(());
-            }
-
-            let mut tmp = [0u8; 8192];
-            let n = tokio::io::AsyncReadExt::read(&mut self.inner, &mut tmp).await?;
-            if n == 0 {
-                if !self.read_pending.is_empty() {
-                    let data = self.read_pending.split_to(self.read_pending.len());
-                    if self.number_of_packet_to_filter > 0 { self.filter_tls(&data); }
-                    self.read_buf.extend_from_slice(&data);
-                }
-                return Ok(());
-            }
-            self.read_pending.extend_from_slice(&tmp[..n]);
-        }
-    }
-}
-
-impl AsyncRead for VisionStream {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        if self.read_buf.is_empty() {
-            let fut = self.fill_read_buf();
+            let fut = self.receive_response();
             tokio::pin!(fut);
             match fut.poll(cx) {
                 Poll::Ready(Ok(())) => {}
@@ -599,28 +175,132 @@ impl AsyncRead for VisionStream {
                 Poll::Pending => return Poll::Pending,
             }
         }
-        if self.read_buf.is_empty() { return Poll::Ready(Ok(())); }
-        let to_copy = self.read_buf.len().min(buf.remaining());
-        buf.put_slice(&self.read_buf[..to_copy]);
-        self.read_buf.advance(to_copy);
-        Poll::Ready(Ok(()))
+
+        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
-impl AsyncWrite for VisionStream {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, io::Error>> {
-        if self.write_pending.is_some() { return self.poll_write_pending(cx); }
-        if self.is_padding {
-            self.write_pending = Some(self.make_write_pending(buf));
-            return self.poll_write_pending(cx);
+impl AsyncWrite for VlessStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        // Send handshake with first write
+        if !self.handshake_sent {
+            let fut = self.send_handshake_with_data(buf);
+            tokio::pin!(fut);
+            match fut.poll(cx) {
+                Poll::Ready(Ok(n)) => return Poll::Ready(Ok(n)),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
-        if self.number_of_packet_to_filter > 0 { self.filter_tls(buf); }
+
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Encode the flow field as a Protobuf field-1 length-delimited value.
+/// Format: [0x0A][varint len][bytes]
+pub(crate) fn build_addon_bytes(flow: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2 + flow.len());
+    buf.push(0x0A); // field 1, wire type 2 (length-delimited)
+    buf.push(flow.len() as u8); // single-byte varint (flow strings are short)
+    buf.extend_from_slice(flow.as_bytes());
+    buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::SocksAddr;
+
+    fn dummy_stream() -> AnyStream {
+        let (client, _server) = tokio::io::duplex(1024);
+        Box::new(client)
+    }
+
+    fn tcp_dest() -> SocksAddr {
+        "1.2.3.4:80".parse().unwrap()
+    }
+
+    // --- build_addon_bytes ---
+
+    #[test]
+    fn test_build_addon_bytes_empty_flow() {
+        let addon = build_addon_bytes("");
+        // tag(1) + len(0) = 2 bytes, no payload
+        assert_eq!(addon, vec![0x0A, 0x00]);
+    }
+
+    #[test]
+    fn test_build_addon_bytes_vision_flow() {
+        let flow = "xtls-rprx-vision";
+        let addon = build_addon_bytes(flow);
+        assert_eq!(addon.len(), 2 + flow.len()); // 18 bytes
+        assert_eq!(addon[0], 0x0A); // field-1, wire-type-2 tag
+        assert_eq!(addon[1], flow.len() as u8); // 0x10 = 16
+        assert_eq!(&addon[2..], flow.as_bytes());
+    }
+
+    // --- build_handshake_header ---
+
+    #[test]
+    fn test_handshake_header_no_flow() {
+        let s = VlessStream::new(
+            dummy_stream(),
+            "5415d8e0-df92-3655-afa4-b79de66413f5",
+            &tcp_dest(),
+            false,
+            None,
+        )
+        .unwrap();
+        let hdr = s.build_handshake_header();
+        // byte 17 (0-indexed) is the addon-length byte
+        assert_eq!(hdr[17], 0); // no addon
+    }
+
+    #[test]
+    fn test_handshake_header_with_flow() {
+        let flow = "xtls-rprx-vision";
+        let s = VlessStream::new(
+            dummy_stream(),
+            "5415d8e0-df92-3655-afa4-b79de66413f5",
+            &tcp_dest(),
+            false,
+            Some(flow.to_string()),
+        )
+        .unwrap();
+        let hdr = s.build_handshake_header();
+        let addon_len = hdr[17] as usize;
+        assert_eq!(addon_len, 2 + flow.len()); // 18
+        let addon = &hdr[18..18 + addon_len];
+        assert_eq!(addon[0], 0x0A);
+        assert_eq!(addon[1], flow.len() as u8);
+        assert_eq!(&addon[2..], flow.as_bytes());
+    }
+
+    // --- new() ---
+
+    #[test]
+    fn test_new_invalid_uuid() {
+        let result =
+            VlessStream::new(dummy_stream(), "not-a-uuid", &tcp_dest(), false, None);
+        assert!(result.is_err());
     }
 }

@@ -68,8 +68,8 @@ rustls = { version = "0.23", default-features = false }
 webpki-roots = "1.0"
 
 # shadow-tls
-tokio-watfaq-rustls = { git = "https://github.com/Watfaq/tokio-rustls.git", rev = "638db32084d7ecf9c2660847b55d48d1186b4055", default-features = false, features = ["logging", "tls12"] }
-watfaq-rustls = { git = "https://github.com/Rigby-Foundation/rustls.git", rev = "c35db86fc4264d0ad54ca44cafe5995fec513144", default-features = false, features = ["std", "tls12"] }
+tokio-watfaq-rustls = { git = "https://github.com/Watfaq/tokio-rustls.git", rev = "cf8961ac1a36e580d0e38bedc8a41ca4a9b301e8", default-features = false, features = ["logging", "tls12"] }
+watfaq-rustls = { git = "https://github.com/Watfaq/rustls.git", rev = "c3ab043d673029d245fd618b9bc86fd6a6109bae", default-features = false }
 
 # Error handing & logging
 thiserror = "2"
