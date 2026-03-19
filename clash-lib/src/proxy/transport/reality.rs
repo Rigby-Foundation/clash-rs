@@ -171,6 +171,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> RealityTlsStream<IO> {
         err.to_string().contains("cannot decrypt peer's message")
     }
 
+    fn is_plaintext_backpressure(err: &io::Error) -> bool {
+        err.kind() == io::ErrorKind::Other
+            && err
+                .to_string()
+                .contains("received plaintext buffer full")
+    }
+
     fn read_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         let mut reader = SyncReadAdapter {
             io: &mut self.io,
@@ -329,6 +336,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncRead for RealityTlsStream<IO> {
                             return Poll::Ready(Ok(()));
                         }
                         return Pin::new(&mut self.io).poll_read(cx, buf);
+                    }
+                    if Self::is_plaintext_backpressure(&e) {
+                        // rustls signals backpressure when plaintext is queued but not drained yet.
+                        // Drain via session.reader() below instead of treating this as a hard failure.
+                        break;
                     }
                     return Poll::Ready(Err(e));
                 }
