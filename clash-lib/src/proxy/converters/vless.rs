@@ -141,9 +141,9 @@ impl TryFrom<&OutboundVless> for Handler {
             server: s.common_opts.server.to_owned(),
             port: s.common_opts.port,
             uuid: s.uuid.clone(),
-            // Vision flow currently wraps TCP stream framing only.
-            // Keep UDP disabled here to avoid broken datagrams on unsupported path.
-            udp: s.udp.unwrap_or(true) && !vision_flow,
+            // Keep UDP enabled. For Vision flow, we use XUDP (command=mux),
+            // matching sing-box behavior and avoiding invalid flow+udp requests.
+            udp: s.udp.unwrap_or(true),
             transport: s
                 .network
                 .clone()
@@ -194,6 +194,7 @@ impl TryFrom<&OutboundVless> for Handler {
                 .flatten(),
             tls,
             flow,
+            xudp: vision_flow,
         }))
     }
 }
@@ -360,6 +361,39 @@ mod tests {
             flow: Some("xtls-rprx-vision".to_string()),
             ..base_config()
         };
-        assert!(Handler::try_from(&config).is_ok());
+
+        let handler = Handler::try_from(&config).unwrap();
+        assert!(handler.test_xudp_enabled());
+        assert!(handler.test_udp_enabled());
+    }
+
+    #[test]
+    fn test_vless_reality_with_udp443_flow_enables_xudp() {
+        let config = OutboundVless {
+            reality_opts: Some(RealityOpt {
+                public_key: "Vc8ycAgKqfRvtXjvGP0ry_U91o5wgrQlqOhHq72HYRs"
+                    .to_string(),
+                short_id: "1bc2c1ef1c".to_string(),
+            }),
+            server_name: Some("www.microsoft.com".to_string()),
+            flow: Some("xtls-rprx-vision-udp443".to_string()),
+            ..base_config()
+        };
+
+        let handler = Handler::try_from(&config).unwrap();
+        assert!(handler.test_xudp_enabled());
+        assert!(handler.test_udp_enabled());
+    }
+
+    #[test]
+    fn test_vless_non_vision_flow_disables_xudp() {
+        let config = OutboundVless {
+            flow: None,
+            ..base_config()
+        };
+
+        let handler = Handler::try_from(&config).unwrap();
+        assert!(!handler.test_xudp_enabled());
+        assert!(handler.test_udp_enabled());
     }
 }

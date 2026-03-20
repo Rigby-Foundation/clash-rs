@@ -16,6 +16,7 @@ use crate::{
 const VLESS_VERSION: u8 = 0;
 const VLESS_COMMAND_TCP: u8 = 1;
 const VLESS_COMMAND_UDP: u8 = 2;
+const VLESS_COMMAND_MUX: u8 = 3;
 
 const TLS13_SUPPORTED_VERSIONS: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
 const TLS_CLIENT_HANDSHAKE_START: [u8; 2] = [0x16, 0x03];
@@ -50,6 +51,7 @@ pub struct VlessStream {
     uuid: uuid::Uuid,
     destination: SocksAddr,
     is_udp: bool,
+    xudp: bool,
     flow: Option<String>,
 }
 
@@ -59,6 +61,7 @@ impl VlessStream {
         uuid: &str,
         destination: &SocksAddr,
         is_udp: bool,
+        xudp: bool,
         flow: Option<String>,
     ) -> io::Result<Self> {
         let uuid = uuid::Uuid::parse_str(uuid).map_err(|_| {
@@ -81,6 +84,7 @@ impl VlessStream {
             uuid,
             destination: destination.clone(),
             is_udp,
+            xudp,
             flow,
         })
     }
@@ -102,13 +106,18 @@ impl VlessStream {
             buf.put_u8(0); // no addon
         }
 
-        if self.is_udp {
-            buf.put_u8(VLESS_COMMAND_UDP);
+        let command = if self.xudp {
+            VLESS_COMMAND_MUX
+        } else if self.is_udp {
+            VLESS_COMMAND_UDP
         } else {
-            buf.put_u8(VLESS_COMMAND_TCP);
-        }
+            VLESS_COMMAND_TCP
+        };
+        buf.put_u8(command);
 
-        self.destination.write_to_buf_vmess(&mut buf);
+        if command != VLESS_COMMAND_MUX {
+            self.destination.write_to_buf_vmess(&mut buf);
+        }
         buf
     }
 
@@ -186,10 +195,7 @@ impl VlessStream {
                     self.response_additional_remaining = Some(remaining - n);
                 }
                 Poll::Ready(Err(e)) => {
-                    error!(
-                        "Failed to read VLESS additional info: {}",
-                        e
-                    );
+                    error!("Failed to read VLESS additional info: {}", e);
                     return Poll::Ready(Err(e));
                 }
                 Poll::Pending => return Poll::Pending,
@@ -229,10 +235,9 @@ impl VlessStream {
                 break;
             }
 
-            match Pin::new(&mut self.inner).poll_write(
-                cx,
-                &pending[self.handshake_pending_pos..],
-            ) {
+            match Pin::new(&mut self.inner)
+                .poll_write(cx, &pending[self.handshake_pending_pos..])
+            {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -288,16 +293,25 @@ impl AsyncWrite for VlessStream {
     ) -> Poll<Result<usize, io::Error>> {
         let vision_flow = matches!(
             self.flow.as_deref(),
-            Some("xtls-rprx-vision")
+            Some("xtls-rprx-vision" | "xtls-rprx-vision-udp443")
         );
+        let mux_handshake = self.xudp;
 
         // Send handshake with first write
         if !self.handshake_sent {
-            let payload = if vision_flow { &[][..] } else { buf };
-            let ack_len = if vision_flow { 0 } else { buf.len() };
+            let payload = if vision_flow || mux_handshake {
+                &[][..]
+            } else {
+                buf
+            };
+            let ack_len = if vision_flow || mux_handshake {
+                0
+            } else {
+                buf.len()
+            };
             match self.poll_send_handshake(cx, payload, ack_len) {
                 Poll::Ready(Ok(n)) => {
-                    if !vision_flow || buf.is_empty() {
+                    if (!vision_flow && !mux_handshake) || buf.is_empty() {
                         return Poll::Ready(Ok(n));
                     }
                 }
@@ -558,10 +572,8 @@ impl VisionStream {
 
         let mut raw_tail = BytesMut::new();
         if raw_start < slices.len() {
-            let remaining = slices[raw_start..]
-                .iter()
-                .map(|slice| slice.len())
-                .sum();
+            let remaining =
+                slices[raw_start..].iter().map(|slice| slice.len()).sum();
             raw_tail.reserve(remaining);
             for slice in &slices[raw_start..] {
                 raw_tail.extend_from_slice(slice);
@@ -609,7 +621,8 @@ impl VisionStream {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
-            let switched = switch_reality_raw_modes(&mut self.inner.inner, false, true)?;
+            let switched =
+                switch_reality_raw_modes(&mut self.inner.inner, false, true)?;
             debug!("vision direct write switch: switched={switched}");
             pending.switch_done = true;
         }
@@ -981,6 +994,7 @@ mod tests {
             "b831381d-6324-4d53-ad4f-8cda48b30811",
             &addr,
             false,
+            false,
             None,
         )
         .unwrap();
@@ -1007,6 +1021,7 @@ mod tests {
             "b831381d-6324-4d53-ad4f-8cda48b30811",
             &addr,
             false,
+            false,
             Some("xtls-rprx-vision".to_owned()),
         )
         .unwrap();
@@ -1018,6 +1033,63 @@ mod tests {
         assert_eq!(header[17], addon.len() as u8, "addon_len");
         assert_eq!(&header[18..18 + addon.len()], addon.as_slice());
         assert_eq!(header[18 + addon.len()], VLESS_COMMAND_TCP);
+    }
+
+    #[test]
+    fn test_handshake_header_xudp_mux_no_destination() {
+        use crate::session::SocksAddr;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let addr = SocksAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            80,
+        ));
+        let inner: AnyStream = Box::new(tokio::io::duplex(1024).0);
+        let stream = VlessStream::new(
+            inner,
+            "b831381d-6324-4d53-ad4f-8cda48b30811",
+            &addr,
+            true,
+            true,
+            Some("xtls-rprx-vision".to_owned()),
+        )
+        .unwrap();
+
+        let header = stream.build_handshake_header();
+        assert_eq!(header[0], VLESS_VERSION);
+        assert_eq!(header[17], 18, "addon_len");
+        assert_eq!(header[18 + 18], VLESS_COMMAND_MUX);
+        // Mux command does not carry destination in request header.
+        assert_eq!(header.len(), 1 + 16 + 1 + 18 + 1);
+    }
+
+    #[test]
+    fn test_handshake_header_xudp_mux_with_udp443_flow() {
+        use crate::session::SocksAddr;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let addr = SocksAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+            443,
+        ));
+        let inner: AnyStream = Box::new(tokio::io::duplex(1024).0);
+        let stream = VlessStream::new(
+            inner,
+            "b831381d-6324-4d53-ad4f-8cda48b30811",
+            &addr,
+            true,
+            true,
+            Some("xtls-rprx-vision-udp443".to_owned()),
+        )
+        .unwrap();
+
+        let header = stream.build_handshake_header();
+        let addon = build_addon_bytes("xtls-rprx-vision-udp443");
+        assert_eq!(header[0], VLESS_VERSION);
+        assert_eq!(header[17], addon.len() as u8, "addon_len");
+        assert_eq!(&header[18..18 + addon.len()], addon.as_slice());
+        assert_eq!(header[18 + addon.len()], VLESS_COMMAND_MUX);
+        assert_eq!(header.len(), 1 + 16 + 1 + addon.len() + 1);
     }
 
     #[tokio::test]

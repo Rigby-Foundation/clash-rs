@@ -14,7 +14,7 @@ use crate::{
         dns::ThreadSafeDNSResolver,
     },
     impl_default_connector,
-    proxy::vless::datagram::OutboundDatagramVless,
+    proxy::vless::datagram::{OutboundDatagramVless, OutboundDatagramVlessXudp},
     session::Session,
 };
 use async_trait::async_trait;
@@ -34,6 +34,7 @@ pub struct HandlerOptions {
     pub transport: Option<Box<dyn Transport>>,
     pub tls: Option<Box<dyn Transport>>,
     pub flow: Option<String>,
+    pub xudp: bool,
 }
 
 pub struct Handler {
@@ -64,6 +65,7 @@ impl Handler {
         s: AnyStream,
         sess: &Session,
         is_udp: bool,
+        use_xudp: bool,
     ) -> io::Result<AnyStream> {
         let s = if let Some(tls) = self.opts.tls.as_ref() {
             tls.proxy_stream(s).await?
@@ -82,6 +84,7 @@ impl Handler {
             &self.opts.uuid,
             &sess.destination,
             is_udp,
+            use_xudp,
             self.opts.flow.clone(),
         )?;
 
@@ -93,6 +96,16 @@ impl Handler {
         } else {
             Ok(Box::new(vless_stream))
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_xudp_enabled(&self) -> bool {
+        self.opts.xudp
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_udp_enabled(&self) -> bool {
+        self.opts.udp
     }
 }
 
@@ -175,7 +188,7 @@ impl OutboundHandler for Handler {
             )
             .await?;
 
-        let s = self.inner_proxy_stream(stream, sess, false).await?;
+        let s = self.inner_proxy_stream(stream, sess, false, false).await?;
         let chained = ChainedStreamWrapper::new(s);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
@@ -198,8 +211,18 @@ impl OutboundHandler for Handler {
             )
             .await?;
 
-        let stream = self.inner_proxy_stream(stream, sess, true).await?;
-        let d = OutboundDatagramVless::new(stream, sess.destination.clone());
+        let use_xudp = self.opts.xudp;
+        let stream = self
+            .inner_proxy_stream(stream, sess, true, use_xudp)
+            .await?;
+        let d: crate::proxy::AnyOutboundDatagram = if use_xudp {
+            Box::new(OutboundDatagramVlessXudp::new(
+                stream,
+                sess.destination.clone(),
+            ))
+        } else {
+            Box::new(OutboundDatagramVless::new(stream, sess.destination.clone()))
+        };
 
         let chained = ChainedDatagramWrapper::new(d);
         chained.append_to_chain(self.name()).await;
@@ -282,6 +305,7 @@ mod tests {
             tls: tls_client(None),
             transport: Some(Box::new(ws_client)),
             flow: None,
+            xudp: false,
         };
         let handler = Arc::new(Handler::new(opts));
         let runner = get_ws_runner().await?;
