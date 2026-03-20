@@ -19,13 +19,12 @@ authors = ["https://github.com/Watfaq/clash-rs/graphs/contributors"]
 homepage = "https://github.com/watfaq/clash-rs"
 
 [profile.release]
-opt-level = "s"          # Optimize for size
-codegen-units = 1        # Single codegen unit for better optimization
-lto = "fat"              # Full LTO for maximum optimization
-strip = true             # Strip symbols
-debug = false            # No debug info in release
-panic = "abort"          # Smaller panic handling
-overflow-checks = false  # Disable overflow checks for smaller size
+opt-level = "s"
+codegen-units = 1
+lto = "thin"
+strip = true
+debug = false
+panic = "abort"
 
 [workspace.lints.rust]
 warnings = "allow"
