@@ -1007,8 +1007,9 @@ impl AsyncWrite for VisionStream {
             return self.poll_write_pending(cx);
         }
 
-        // After padding ends, stop filtering - handshake is complete
-        // Filtering application data breaks TLS and causes connection hangs
+        if self.number_of_packet_to_filter > 0 {
+            self.filter_tls_buffers(&[buf]);
+        }
 
         if self.write_direct {
             let head = buf
