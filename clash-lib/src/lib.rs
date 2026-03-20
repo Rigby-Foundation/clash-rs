@@ -49,7 +49,7 @@ pub mod app;
 pub mod config;
 
 mod common;
-mod proxy;
+pub mod proxy;
 mod session;
 
 use crate::common::{geodata, mmdb::MmdbLookup};

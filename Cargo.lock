@@ -6154,6 +6154,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigby-server"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "clash-lib",
+ "hex",
+ "rand 0.8.5",
+ "serde",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
