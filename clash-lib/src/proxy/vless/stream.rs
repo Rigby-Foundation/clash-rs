@@ -357,6 +357,7 @@ pub struct VisionStream {
     is_padding: bool,
     write_direct: bool,
     write_uuid: bool,
+    raw_write_switched: bool,
 
     // Read state
     within_padding_buffers: bool,
@@ -398,6 +399,7 @@ impl VisionStream {
             is_padding: true,
             write_direct: false,
             write_uuid: true,
+            raw_write_switched: false,
             within_padding_buffers: true,
             remaining_content: -1,
             remaining_padding: -1,
@@ -531,7 +533,17 @@ impl VisionStream {
         }
 
         if !self.is_padding {
-            // After padding ended, write directly
+            // After padding ended, switch Reality to raw write mode once
+            if !self.raw_write_switched {
+                self.raw_write_switched = true;
+                if let Err(e) = switch_reality_raw_modes(&mut self.inner.inner, false, true) {
+                    warn!("Vision: failed to switch Reality to raw write mode: {}", e);
+                } else {
+                    info!("Vision: switched Reality to raw write mode. dest={}", self.inner.destination);
+                }
+            }
+            
+            // Write directly without Vision framing
             return WritePending {
                 orig_len: data.len(),
                 data: BytesMut::from(data),
@@ -765,8 +777,10 @@ impl VisionStream {
                         self.within_padding_buffers = true;
                     }
                     COMMAND_PADDING_END => {
-                        info!("Vision: PADDING_END received, switching to raw. dest={}", self.inner.destination);
+                        info!("Vision: PADDING_END received, switching to raw read mode. dest={}", self.inner.destination);
                         self.within_padding_buffers = false;
+                        // Switch Reality to raw read mode since padding is done
+                        switch_reality_raw_modes(&mut self.inner.inner, true, false)?;
                     }
                     COMMAND_PADDING_DIRECT => {
                         info!("Vision: PADDING_DIRECT received, switching to XTLS raw. dest={}", self.inner.destination);
