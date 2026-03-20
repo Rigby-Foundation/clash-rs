@@ -9,7 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::debug;
+use tracing::{debug, info, warn};
 use watfaq_rustls::{
     ClientConfig, ClientConnection, ConnectionCommon, Error as RustlsError,
     RootCertStore, SideData,
@@ -303,10 +303,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncRead for RealityTlsStream<IO> {
                     break;
                 }
                 Poll::Ready(Err(e)) => {
-                    if !self.raw_read_mode
-                        && self.raw_write_mode
-                        && Self::should_autoswitch_raw_read(&e)
-                    {
+                    let should_auto = Self::should_autoswitch_raw_read(&e);
+                    if !self.raw_read_mode && self.raw_write_mode && should_auto {
+                        info!(
+                            "Reality: auto-switching to raw read mode on decrypt error"
+                        );
                         // Try draining already-decoded plaintext first.
                         // In Vision direct transition, decrypt errors can happen
                         // after we already decoded the final framed bytes.
@@ -336,6 +337,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncRead for RealityTlsStream<IO> {
                             return Poll::Ready(Ok(()));
                         }
                         return Pin::new(&mut self.io).poll_read(cx, buf);
+                    }
+                    if !self.raw_read_mode && should_auto {
+                        // raw_write_mode is false but we got decrypt error
+                        // This means the server switched to raw before we did on write side
+                        warn!(
+                            "Reality: decrypt error but raw_write_mode=false, cannot auto-switch"
+                        );
                     }
                     if Self::is_plaintext_backpressure(&e) {
                         // rustls signals backpressure when plaintext is queued but not drained yet.
