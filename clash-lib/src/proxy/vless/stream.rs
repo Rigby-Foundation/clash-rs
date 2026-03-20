@@ -707,21 +707,16 @@ impl VisionStream {
 
             // Need frame header: [UUID(16)][Command(1)][ContentLen(2)][PaddingLen(2)]
             if self.remaining_content == -1 && self.remaining_padding == -1 {
-                // Check if we have enough data for UUID check (first frame only)
-                if self.read_pending.len() >= 16 {
-                    // Check UUID mismatch -> raw data
-                    if self.read_pending[..16] != self.uuid {
-                        info!(
-                            "Vision: UUID mismatch, raw data detected. dest={}",
-                            self.inner.destination
-                        );
-                        self.within_padding_buffers = false;
-                        continue;
-                    }
-                }
-
-                // Need at least 21 bytes for full header
-                if self.read_pending.len() < 21 {
+                // Check for first Vision frame (UUID should be present only in first frame)
+                if self.read_pending.len() >= 21 && self.read_pending[..16] == self.uuid {
+                    // This is a Vision frame, parse it
+                } else if self.read_pending.len() >= 16 {
+                    // No UUID match - this is raw TLS data, not Vision frame
+                    let data = self.read_pending.split_to(self.read_pending.len());
+                    self.read_buf.extend_from_slice(&data);
+                    return Ok(true);
+                } else {
+                    // Need more data to determine if this is Vision frame or raw data
                     return Ok(!self.read_buf.is_empty());
                 }
 
