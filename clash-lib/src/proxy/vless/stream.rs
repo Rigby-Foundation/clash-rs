@@ -422,10 +422,29 @@ impl VisionStream {
                 return;
             }
             self.number_of_packet_to_filter -= 1;
+            
+            let head = buffer
+                .iter()
+                .take(16)
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join("");
+            info!(
+                "Vision: filtering packet len={} head={} filter_left={} dest={}",
+                buffer.len(),
+                head,
+                self.number_of_packet_to_filter,
+                self.inner.destination
+            );
 
             if buffer.len() > 6 {
                 if buffer.starts_with(&TLS_SERVER_HANDSHAKE_START) {
                     self.is_tls = true;
+                    info!(
+                        "Vision: Server Hello detected. byte[5]=0x{:02x} dest={}",
+                        buffer[5],
+                        self.inner.destination
+                    );
                     if buffer[5] == 0x02 {
                         self.is_tls12_or_above = true;
                         self.remaining_server_hello =
@@ -437,6 +456,11 @@ impl VisionStream {
                             if cipher_index + 1 < buffer.len() {
                                 self.cipher = ((buffer[cipher_index] as u16) << 8)
                                     | buffer[cipher_index + 1] as u16;
+                                info!(
+                                    "Vision: Cipher suite detected: 0x{:04x} dest={}",
+                                    self.cipher,
+                                    self.inner.destination
+                                );
                             }
                         }
                     }
@@ -444,6 +468,10 @@ impl VisionStream {
                     && buffer[5] == 0x01
                 {
                     self.is_tls = true;
+                    info!(
+                        "Vision: Client Hello detected. dest={}",
+                        self.inner.destination
+                    );
                 }
             }
 
@@ -457,17 +485,24 @@ impl VisionStream {
                 {
                     self.enable_xtls =
                         matches!(self.cipher, 0x1301 | 0x1302 | 0x1303 | 0x1304);
-                    debug!(
-                        "vision tls13 detected: cipher=0x{:04x} enable_xtls={} filter_left={}",
+                    info!(
+                        "Vision: TLS 1.3 detected! cipher=0x{:04x} enable_xtls={} dest={}",
                         self.cipher,
                         self.enable_xtls,
-                        self.number_of_packet_to_filter
+                        self.inner.destination
                     );
                     self.number_of_packet_to_filter = 0;
                     return;
                 }
 
                 if self.remaining_server_hello == 0 {
+                    info!(
+                        "Vision: Server Hello fully processed. cipher=0x{:04x} is_tls={} is_tls12_plus={} dest={}",
+                        self.cipher,
+                        self.is_tls,
+                        self.is_tls12_or_above,
+                        self.inner.destination
+                    );
                     self.number_of_packet_to_filter = 0;
                     return;
                 }
