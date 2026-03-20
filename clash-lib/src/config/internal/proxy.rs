@@ -309,6 +309,11 @@ pub struct OutboundRigby {
     pub mux: bool,
     #[serde(default = "default_bool_true")]
     pub udp: bool,
+    // Reality steganography options
+    pub reality_public_key: Option<String>,
+    pub reality_short_id: Option<String>,
+    pub client_fingerprint: Option<String>,
+    pub alpn: Option<Vec<String>>,
 }
 
 #[cfg(feature = "wireguard")]

@@ -46,6 +46,21 @@ impl TryFrom<OutboundRigby> for Handler {
             .as_deref()
             .map(|v| decode_key32(v, "rigby client-private-key"))
             .transpose()?;
+        
+        // Parse Reality public key if provided
+        let reality_public_key = value
+            .reality_public_key
+            .as_deref()
+            .map(|v| decode_key32(v, "rigby reality-public-key"))
+            .transpose()?;
+        
+        // Parse Reality short ID if provided
+        let reality_short_id = value
+            .reality_short_id
+            .as_deref()
+            .map(|v| hex::decode(v).map_err(|_| 
+                Error::InvalidConfig("rigby reality-short-id must be hex string".to_string())))
+            .transpose()?;
 
         Ok(Handler::new(HandlerOptions {
             name: value.common_opts.name.clone(),
@@ -61,6 +76,10 @@ impl TryFrom<OutboundRigby> for Handler {
             padding: value.padding,
             mux: value.mux,
             udp: value.udp,
+            reality_public_key,
+            reality_short_id,
+            client_fingerprint: value.client_fingerprint,
+            alpn: value.alpn,
         }))
     }
 }

@@ -43,7 +43,12 @@ use tokio::{
     sync::{Mutex, RwLock, mpsc},
 };
 use tokio_util::sync::PollSender;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
+use watfaq_rustls::{
+    ClientConfig, ClientConnection, RootCertStore,
+    client::{ClientFingerprint, RealityConfig},
+    pki_types::ServerName,
+};
 
 const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 const PROTOCOL_VERSION: u8 = 1;
@@ -51,6 +56,13 @@ const MAX_FRAME_PAYLOAD: usize = 1200;
 const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(6);
 const HANDSHAKE_MAX_SKEW: Duration = Duration::from_secs(120);
 const SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+// TLS Reality steganography constants
+const TLS_CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
+const TLS_VERSION_1_2: [u8; 2] = [0x03, 0x03];
+const TLS_VERSION_1_3: [u8; 2] = [0x03, 0x04];
+const MAX_TLS_RECORD_SIZE: usize = 16384;
+const TLS_RECORD_HEADER_SIZE: usize = 5; // type(1) + version(2) + length(2)
 
 #[derive(Clone)]
 pub struct HandlerOptions {
@@ -64,6 +76,107 @@ pub struct HandlerOptions {
     pub padding: bool,
     pub mux: bool,
     pub udp: bool,
+    // Reality steganography fields
+    pub reality_public_key: Option<[u8; 32]>,
+    pub reality_short_id: Option<Vec<u8>>,
+    pub client_fingerprint: Option<String>,
+    pub alpn: Option<Vec<String>>,
+}
+
+// TLS Reality steganographic transport for rigby://
+// Wraps UDP packets in TLS Application Data records to mimic Chrome QUIC traffic
+struct RigbyRealityTransport {
+    reality_client: Option<ClientConnection>,
+    tls_sequence: u64,
+    handshake_done: bool,
+    pending_cleartext: Vec<u8>,
+}
+
+impl RigbyRealityTransport {
+    fn new(reality_config: Option<RealityConfig>, sni: Option<String>) -> io::Result<Self> {
+        let reality_client = if let (Some(config), Some(sni)) = (reality_config, sni) {
+            let root_store: RootCertStore = 
+                webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
+            let mut tls_config = ClientConfig::builder()
+                .with_root_certificates(Arc::new(root_store))
+                .with_reality(config)
+                .with_no_client_auth();
+
+            let sni: ServerName<'static> = ServerName::try_from(sni)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+
+            Some(ClientConnection::new(Arc::new(tls_config), sni)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            reality_client,
+            tls_sequence: 0,
+            handshake_done: false,
+            pending_cleartext: Vec::new(),
+        })
+    }
+
+    // Wrap rigby UDP packet as TLS Application Data record
+    fn wrap_as_tls_record(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
+        if let Some(ref mut client) = self.reality_client {
+            if !self.handshake_done {
+                // During handshake, Reality handles the wrapping
+                // Store cleartext for later
+                self.pending_cleartext.extend_from_slice(data);
+                return Ok(Vec::new()); // Don't send yet
+            }
+
+            // Post-handshake: wrap as TLS Application Data
+            let mut tls_record = Vec::with_capacity(TLS_RECORD_HEADER_SIZE + data.len());
+            tls_record.push(TLS_CONTENT_TYPE_APPLICATION_DATA);
+            tls_record.extend_from_slice(&TLS_VERSION_1_3);
+            tls_record.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            tls_record.extend_from_slice(data);
+            
+            self.tls_sequence += 1;
+            Ok(tls_record)
+        } else {
+            // No Reality - send raw UDP
+            Ok(data.to_vec())
+        }
+    }
+
+    // Unwrap TLS Application Data record to get rigby data
+    fn unwrap_tls_record(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
+        if let Some(ref mut client) = self.reality_client {
+            if !self.handshake_done {
+                // During handshake, let Reality handle it
+                return Ok(data.to_vec());
+            }
+
+            // Post-handshake: unwrap TLS record
+            if data.len() < TLS_RECORD_HEADER_SIZE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "TLS record too short"));
+            }
+
+            if data[0] != TLS_CONTENT_TYPE_APPLICATION_DATA {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Not TLS Application Data"));
+            }
+
+            let payload_len = u16::from_be_bytes([data[3], data[4]]) as usize;
+            if data.len() < TLS_RECORD_HEADER_SIZE + payload_len {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Incomplete TLS record"));
+            }
+
+            Ok(data[TLS_RECORD_HEADER_SIZE..TLS_RECORD_HEADER_SIZE + payload_len].to_vec())
+        } else {
+            // No Reality - data is raw
+            Ok(data.to_vec())
+        }
+    }
+
+    fn mark_handshake_done(&mut self) -> Vec<u8> {
+        self.handshake_done = true;
+        std::mem::take(&mut self.pending_cleartext)
+    }
 }
 
 pub struct Handler {
@@ -390,6 +503,24 @@ impl RigbyClientConnection {
             .await?;
         let (mut sink, mut stream) = datagram.split();
 
+        // Initialize Reality TLS transport if configured
+        let reality_config = if let Some(pub_key) = opts.reality_public_key {
+            let short_id = opts.reality_short_id.unwrap_or_else(|| vec![0u8; 8]);
+            let mut reality = RealityConfig::new(pub_key, short_id)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            
+            if let Some(fingerprint_name) = &opts.client_fingerprint {
+                let fingerprint = ClientFingerprint::from_name(fingerprint_name)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+                reality = reality.with_client_fingerprint(fingerprint);
+            }
+            Some(reality)
+        } else {
+            None
+        };
+
+        let mut reality_transport = RigbyRealityTransport::new(reality_config, opts.sni.clone())?;
+
         let params = NoiseParams::from_str(NOISE_PATTERN)
             .map_err(|e| io::Error::other(e.to_string()))?;
         let local_private = opts
@@ -406,12 +537,17 @@ impl RigbyClientConnection {
         let hs_len = hs
             .write_message(&hs_payload, &mut hs_msg)
             .map_err(|e| io::Error::other(e.to_string()))?;
-        sink.send(UdpPacket::new(
-            hs_msg[..hs_len].to_vec(),
-            SocksAddr::any_ipv4(),
-            destination.clone(),
-        ))
-        .await?;
+        
+        // Wrap handshake message as TLS record if Reality is enabled
+        let wrapped_hs = reality_transport.wrap_as_tls_record(&hs_msg[..hs_len])?;
+        if !wrapped_hs.is_empty() {
+            sink.send(UdpPacket::new(
+                wrapped_hs,
+                SocksAddr::any_ipv4(),
+                destination.clone(),
+            ))
+            .await?;
+        }
 
         let response = tokio::time::timeout(CLIENT_HANDSHAKE_TIMEOUT, stream.next())
             .await
@@ -422,12 +558,22 @@ impl RigbyClientConnection {
                 io::Error::new(io::ErrorKind::UnexpectedEof, "rigby handshake eof")
             })?;
 
+        // Unwrap TLS record to get raw handshake response
+        let unwrapped_response = reality_transport.unwrap_tls_record(&response.data)?;
+        
         let mut hs_buf = vec![0u8; 2048];
-        hs.read_message(&response.data, &mut hs_buf)
+        hs.read_message(&unwrapped_response, &mut hs_buf)
             .map_err(|e| io::Error::other(format!("rigby handshake failed: {e}")))?;
         let mut transport = hs
             .into_transport_mode()
             .map_err(|e| io::Error::other(e.to_string()))?;
+
+        // Mark handshake done and send any pending cleartext
+        let pending_data = reality_transport.mark_handshake_done();
+        if !pending_data.is_empty() {
+            warn!("rigby: sending {} bytes of pending cleartext after handshake", pending_data.len());
+            // TODO: Send pending data
+        }
 
         let streams: Arc<RwLock<HashMap<u16, mpsc::Sender<Vec<u8>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -442,6 +588,11 @@ impl RigbyClientConnection {
         let destination_for_send = destination.clone();
         let padding = opts.padding;
 
+        // Move reality_transport into the async task
+        let mut reality_transport = Arc::new(Mutex::new(reality_transport));
+        let reality_for_send = reality_transport.clone();
+        let reality_for_recv = reality_transport.clone();
+
         tokio::spawn(async move {
             let mut send_seq = 1u32;
             let mut recv_window = RecvWindow::default();
@@ -451,7 +602,7 @@ impl RigbyClientConnection {
                 tokio::select! {
                     maybe_frame = outgoing_rx.recv() => {
                         let Some(frame) = maybe_frame else { break };
-                        if let Err(e) = send_encrypted_frame(
+                        if let Err(e) = send_encrypted_frame_with_reality(
                             &mut sink,
                             &mut transport,
                             &destination_for_send,
@@ -459,6 +610,7 @@ impl RigbyClientConnection {
                             &recv_window,
                             &frame,
                             padding,
+                            reality_for_send.clone(),
                         ).await {
                             trace!("rigby send loop ended: {e}");
                             break;
@@ -466,7 +618,17 @@ impl RigbyClientConnection {
                     }
                     maybe_pkt = stream.next() => {
                         let Some(pkt) = maybe_pkt else { break };
-                        let decoded = match decrypt_packet(&mut transport, &pkt.data) {
+                        
+                        // Unwrap TLS record first
+                        let unwrapped_data = {
+                            let mut reality = reality_for_recv.lock().await;
+                            match reality.unwrap_tls_record(&pkt.data) {
+                                Ok(data) => data,
+                                Err(_) => continue,
+                            }
+                        };
+                        
+                        let decoded = match decrypt_packet(&mut transport, &unwrapped_data) {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
@@ -932,6 +1094,46 @@ where
         destination.clone(),
     ))
     .await
+}
+
+async fn send_encrypted_frame_with_reality<S>(
+    sink: &mut S,
+    transport: &mut TransportState,
+    destination: &SocksAddr,
+    send_seq: &mut u32,
+    recv_window: &RecvWindow,
+    frame: &OutgoingFrame,
+    padding: bool,
+    reality_transport: Arc<Mutex<RigbyRealityTransport>>,
+) -> io::Result<()>
+where
+    S: Sink<UdpPacket, Error = io::Error> + Unpin,
+{
+    let (ack, ack_bits) = recv_window.ack_tuple();
+    let plain = encode_plain_packet(*send_seq, ack, ack_bits, frame, padding)?;
+    *send_seq = send_seq.wrapping_add(1);
+
+    let mut encrypted = vec![0u8; plain.len() + 64];
+    let n = transport
+        .write_message(&plain, &mut encrypted)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    
+    // Wrap encrypted data as TLS record
+    let wrapped_data = {
+        let mut reality = reality_transport.lock().await;
+        reality.wrap_as_tls_record(&encrypted[..n])?
+    };
+    
+    if !wrapped_data.is_empty() {
+        sink.send(UdpPacket::new(
+            wrapped_data,
+            SocksAddr::any_ipv4(),
+            destination.clone(),
+        ))
+        .await
+    } else {
+        Ok(()) // Data buffered during handshake
+    }
 }
 
 async fn send_encrypted_to_socket(
