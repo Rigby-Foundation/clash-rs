@@ -6,6 +6,7 @@ use std::{
 
 use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::{sleep, Duration, Sleep};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -370,6 +371,7 @@ struct VisionWritePending {
     switch_done: bool,
     raw_tail: BytesMut,
     raw_tail_pos: usize,
+    raw_tail_sleep: Option<Pin<Box<Sleep>>>,
 }
 
 impl VisionStream {
@@ -590,6 +592,7 @@ impl VisionStream {
             switch_done: false,
             raw_tail,
             raw_tail_pos: 0,
+            raw_tail_sleep: None,
         }
     }
 
@@ -627,6 +630,25 @@ impl VisionStream {
                 switch_reality_raw_modes(&mut self.inner.inner, false, true)?;
             debug!("vision direct write switch: switched={switched}");
             pending.switch_done = true;
+            
+            // If we have raw_tail data, create a sleep timer to give server time to switch
+            if !pending.raw_tail.is_empty() {
+                info!(
+                    "Vision: switched to raw write, sleeping 5ms before raw_tail. dest={}",
+                    self.inner.destination
+                );
+                pending.raw_tail_sleep = Some(Box::pin(sleep(Duration::from_millis(5))));
+            }
+        }
+
+        // Wait for sleep if we have raw_tail data after DIRECT command
+        if let Some(ref mut sleep_fut) = pending.raw_tail_sleep {
+            match sleep_fut.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    pending.raw_tail_sleep = None; // Sleep done
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
 
         while pending.raw_tail_pos < pending.raw_tail.len() {
