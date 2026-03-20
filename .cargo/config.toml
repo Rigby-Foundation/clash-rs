@@ -1,7 +1,24 @@
 [build]
 target-dir = "target"
-rustflags = ["--cfg", "tokio_unstable"]
+rustflags = [
+    "--cfg", "tokio_unstable",
+    "-C", "embed-bitcode=no",      # Don't embed bitcode (smaller)
+]
 
 [env]
 SENTRY_DSN = { value = "PLEASE DEFINE AT COMPILE TIME" }
 RUSTC_BOOTSTRAP = { value = "1" }
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "--cfg", "tokio_unstable", 
+    "-C", "link-arg=-s",           # Strip symbols at link time
+    "-C", "embed-bitcode=no",      # Don't embed bitcode (smaller)
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+    "--cfg", "tokio_unstable",
+    "-C", "link-arg=-s",           # Strip symbols at link time  
+    "-C", "embed-bitcode=no",      # Don't embed bitcode (smaller)
+]
