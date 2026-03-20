@@ -21,7 +21,7 @@ homepage = "https://github.com/watfaq/clash-rs"
 [profile.release]
 opt-level = "s"
 codegen-units = 1
-lto = "thin"
+lto = false
 strip = true
 debug = false
 panic = "abort"
