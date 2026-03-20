@@ -702,19 +702,27 @@ impl VisionStream {
 
             if self.read_remaining_content == -1 && self.read_remaining_padding == -1
             {
-                if self.read_pending.len() < 21 {
+                // Check if this is a Vision frame (starts with UUID)
+                // Need at least 21 bytes: UUID(16) + command(1) + content_len(2) + padding_len(2)
+                // But if we have 16+ bytes and UUID doesn't match, it's raw data
+                if self.read_pending.len() >= 16 {
+                    if self.read_pending[..16] != *self.inner.uuid.as_bytes() {
+                        // UUID doesn't match - this is raw data, not Vision
+                        self.read_padding = false;
+                        continue;
+                    }
+                    // UUID matches - wait for full header if needed
+                    if self.read_pending.len() < 21 {
+                        return Ok(!self.read_buf.is_empty());
+                    }
+                    self.read_pending.advance(16);
+                    self.read_current_command = COMMAND_PADDING_CONTINUE;
+                    self.read_remaining_content = 0;
+                    self.read_remaining_padding = 0;
+                } else {
+                    // Not enough data to check UUID - wait for more
                     return Ok(!self.read_buf.is_empty());
                 }
-
-                if self.read_pending[..16] != *self.inner.uuid.as_bytes() {
-                    self.read_padding = false;
-                    continue;
-                }
-
-                self.read_pending.advance(16);
-                self.read_current_command = COMMAND_PADDING_CONTINUE;
-                self.read_remaining_content = 0;
-                self.read_remaining_padding = 0;
             }
 
             if self.read_remaining_content <= 0 && self.read_remaining_padding <= 0 {
