@@ -548,23 +548,18 @@ impl VisionStream {
         let slices = Self::reshape_buffer(data);
         let mut framed = BytesMut::new();
         let mut spec_index = None;
-        let mut switch_to_direct = false;
 
         for (i, slice) in slices.iter().enumerate() {
             // Check for TLS Application Data
             if self.is_tls && slice.len() > 6 && slice.starts_with(&TLS_APPLICATION_DATA_START) {
-                let command = if self.enable_xtls {
-                    self.write_direct = true;
-                    switch_to_direct = true;
-                    spec_index = Some(i);
-                    COMMAND_PADDING_DIRECT
-                } else {
-                    COMMAND_PADDING_END
-                };
+                // NOTE: XTLS Direct mode requires raw socket access which we don't have
+                // with Reality wrapper. Always use PADDING_END instead of PADDING_DIRECT.
+                // This matches the behavior when enable_xtls=false.
+                let command = COMMAND_PADDING_END;
                 
                 info!(
-                    "Vision: TLS AppData detected, ending padding. command=0x{:02x} enable_xtls={} dest={}",
-                    command, self.enable_xtls, self.inner.destination
+                    "Vision: TLS AppData detected, ending padding. command=0x{:02x} dest={}",
+                    command, self.inner.destination
                 );
                 
                 self.is_padding = false;
@@ -601,7 +596,7 @@ impl VisionStream {
             orig_len: data.len(),
             data: framed,
             pos: 0,
-            switch_to_direct,
+            switch_to_direct: false, // XTLS Direct mode disabled - no raw socket access
             switch_done: false,
             raw_tail,
             raw_tail_pos: 0,
