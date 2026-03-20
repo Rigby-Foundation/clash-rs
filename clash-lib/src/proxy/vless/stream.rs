@@ -394,13 +394,19 @@ impl VisionStream {
         for (i, slice) in slices.iter().enumerate() {
             if self.is_tls && slice.len() > 6 && slice.starts_with(&TLS_APPLICATION_DATA_START) {
                 self.is_padding = false;
-                trigger_raw = true;
-                framed.extend_from_slice(&self.padding_frame(slice, COMMAND_PADDING_END));
+                // БАГФИКС: Включаем DIRECT и Raw Mode только если XTLS включен
+                let command = if self.enable_xtls {
+                    trigger_raw = true;
+                    COMMAND_PADDING_DIRECT
+                } else {
+                    COMMAND_PADDING_END
+                };
+                framed.extend_from_slice(&self.padding_frame(slice, command));
                 spec_index = Some(i);
                 break;
             } else if !self.is_tls12_or_above && self.number_of_packet_to_filter <= 1 {
                 self.is_padding = false;
-                trigger_raw = true;
+                // БАГФИКС: Фолбэк для UDP/XUDP. trigger_raw НЕ ВКЛЮЧАЕМ! Остаемся в TLS.
                 framed.extend_from_slice(&self.padding_frame(slice, COMMAND_PADDING_END));
                 spec_index = Some(i);
                 break;
@@ -537,7 +543,8 @@ impl VisionStream {
                     }
                     if cmd == COMMAND_PADDING_END || cmd == COMMAND_PADDING_DIRECT {
                         self.read_state = ReadState::Raw;
-                        if !self.raw_mode_switched {
+                        // БАГФИКС: Отключаем декрипт Reality только для DIRECT!
+                        if cmd == COMMAND_PADDING_DIRECT && !self.raw_mode_switched {
                             let _ = switch_reality_raw_modes(&mut self.inner.inner, true, true);
                             self.raw_mode_switched = true;
                         }
