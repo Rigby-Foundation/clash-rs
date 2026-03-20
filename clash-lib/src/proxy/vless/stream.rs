@@ -6,7 +6,7 @@ use std::{
 
 use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::{debug, error};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     proxy::{AnyStream, transport::switch_reality_raw_modes},
@@ -374,6 +374,10 @@ struct VisionWritePending {
 
 impl VisionStream {
     pub fn new(inner: VlessStream) -> Self {
+        info!(
+            "VisionStream created for {}",
+            inner.destination
+        );
         Self {
             inner,
             write_uuid: true,
@@ -535,12 +539,11 @@ impl VisionStream {
                     self.write_direct = true;
                     direct_switch = true;
                 }
-                debug!(
-                    "vision write application-data split: command=0x{:02x} enable_xtls={} filter_left={} slice_len={}",
+                info!(
+                    "Vision: TLS AppData detected, ending padding mode. command=0x{:02x} enable_xtls={} dest={}",
                     command,
                     self.enable_xtls,
-                    self.number_of_packet_to_filter,
-                    slice.len()
+                    self.inner.destination
                 );
                 self.is_padding = false;
                 raw_start = index + 1;
@@ -549,11 +552,10 @@ impl VisionStream {
             }
 
             if !self.is_tls12_or_above && self.number_of_packet_to_filter <= 1 {
-                debug!(
-                    "vision write fallback-end: is_tls12_or_above={} filter_left={} slice_len={}",
-                    self.is_tls12_or_above,
-                    self.number_of_packet_to_filter,
-                    slice.len()
+                info!(
+                    "Vision: fallback end (non-TLS or TLS<1.2). is_tls={} dest={}",
+                    self.is_tls,
+                    self.inner.destination
                 );
                 self.is_padding = false;
                 raw_start = index + 1;
@@ -656,9 +658,17 @@ impl VisionStream {
         match self.read_current_command {
             COMMAND_PADDING_CONTINUE => {}
             COMMAND_PADDING_END => {
+                info!(
+                    "Vision read: PADDING_END received, switching to raw mode. dest={}",
+                    self.inner.destination
+                );
                 self.read_padding = false;
             }
             COMMAND_PADDING_DIRECT => {
+                info!(
+                    "Vision read: PADDING_DIRECT received, switching to XTLS raw. dest={}",
+                    self.inner.destination
+                );
                 self.read_padding = false;
                 let switched =
                     switch_reality_raw_modes(&mut self.inner.inner, true, false)?;
@@ -708,6 +718,15 @@ impl VisionStream {
                 if self.read_pending.len() >= 16 {
                     if self.read_pending[..16] != *self.inner.uuid.as_bytes() {
                         // UUID doesn't match - this is raw data, not Vision
+                        let head = self.read_pending.iter().take(16)
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<Vec<_>>()
+                            .join("");
+                        info!(
+                            "Vision read: UUID mismatch, treating as raw data. head={} dest={}",
+                            head,
+                            self.inner.destination
+                        );
                         self.read_padding = false;
                         continue;
                     }
