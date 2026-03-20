@@ -445,7 +445,6 @@ impl VisionStream {
             }
         }
 
-        // БАГФИКС: Переключаем Raw Mode только когда буфер с PADDING_END полностью отправлен и сброшен
         if pending.switch_to_direct && !pending.switch_done {
             match Pin::new(&mut self.inner).poll_flush(cx) {
                 Poll::Ready(Ok(())) => {}
@@ -453,8 +452,8 @@ impl VisionStream {
                 Poll::Pending => return Poll::Pending,
             }
             if !self.raw_mode_switched {
-                if let Err(e) = switch_reality_raw_modes(&mut self.inner.inner, true, true) {
-                    warn!("Vision: failed to switch Reality raw mode: {}", e);
+                if let Err(e) = switch_reality_raw_modes(&mut self.inner.inner, false, true) {
+                    warn!("Vision: failed to switch Reality raw write mode: {}", e);
                 }
                 self.raw_mode_switched = true;
             }
