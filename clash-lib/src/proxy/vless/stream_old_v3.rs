@@ -339,333 +339,353 @@ impl AsyncWrite for VlessStream {
     }
 }
 
-/// Clean Vision implementation based on sing-box
-/// Reference: github.com/sagernet/sing-vmess/vless/vision.go
+/// VisionStream wraps a VlessStream and applies XTLS Vision padding blocks.
+///
+/// Block format:
+/// `[optional uuid(16)][command:1][content_len:u16-be][padding_len:u16-be][content][padding]`
 pub struct VisionStream {
     inner: VlessStream,
-    uuid: [u8; 16],
-
-    // TLS detection state
+    write_uuid: bool,
+    is_padding: bool,
+    write_direct: bool,
     is_tls: bool,
     number_of_packet_to_filter: i32,
     is_tls12_or_above: bool,
     remaining_server_hello: i32,
     cipher: u16,
     enable_xtls: bool,
-
-    // Padding state
-    is_padding: bool,
-    write_direct: bool,
-    write_uuid: bool,
-
-    // Read state
-    within_padding_buffers: bool,
-    remaining_content: i32,
-    remaining_padding: i32,
-    current_command: u8,
-    direct_read: bool,
-    
-    // Buffers
-    read_pending: BytesMut,
     read_buf: BytesMut,
-    write_pending: Option<WritePending>,
+    read_pending: BytesMut,
+    read_padding: bool,
+    read_remaining_content: i32,
+    read_remaining_padding: i32,
+    read_current_command: u8,
+    write_pending: Option<VisionWritePending>,
 }
 
-struct WritePending {
+struct VisionWritePending {
     orig_len: usize,
-    data: BytesMut,
-    pos: usize,
-    switch_to_direct: bool,
+    framed: BytesMut,
+    framed_pos: usize,
+    switch_to_raw: bool,
     switch_done: bool,
     raw_tail: BytesMut,
     raw_tail_pos: usize,
-    sleep: Option<Pin<Box<Sleep>>>,
+    raw_tail_sleep: Option<Pin<Box<Sleep>>>,
 }
 
 impl VisionStream {
-    pub fn new(vless_stream: VlessStream) -> Self {
-        info!("VisionStream created for {}", vless_stream.destination);
-        let uuid = *vless_stream.uuid.as_bytes();
+    pub fn new(inner: VlessStream) -> Self {
+        info!(
+            "VisionStream created for {}",
+            inner.destination
+        );
         Self {
-            inner: vless_stream,
-            uuid,
+            inner,
+            write_uuid: true,
+            is_padding: true,
+            write_direct: false,
             is_tls: false,
             number_of_packet_to_filter: 8,
             is_tls12_or_above: false,
             remaining_server_hello: -1,
             cipher: 0,
             enable_xtls: false,
-            is_padding: true,
-            write_direct: false,
-            write_uuid: true,
-            within_padding_buffers: true,
-            remaining_content: -1,
-            remaining_padding: -1,
-            current_command: 0,
-            direct_read: false,
-            read_pending: BytesMut::new(),
             read_buf: BytesMut::new(),
+            read_pending: BytesMut::new(),
+            read_padding: true,
+            read_remaining_content: -1,
+            read_remaining_padding: -1,
+            read_current_command: 0,
             write_pending: None,
         }
     }
 
-    // Filter TLS packets to detect handshake and enable XTLS
-    fn filter_tls(&mut self, data: &[u8]) {
-        if self.number_of_packet_to_filter <= 0 || data.len() <= 6 {
-            return;
-        }
-
-        self.number_of_packet_to_filter -= 1;
-
-        // Check for Server Hello
-        if data.starts_with(&TLS_SERVER_HANDSHAKE_START) && data[5] == 0x02 {
-            self.is_tls = true;
-            self.is_tls12_or_above = true;
-            self.remaining_server_hello = (((data[3] as i32) << 8) | data[4] as i32) + 5;
-
-            // Extract cipher suite
-            if data.len() >= 79 && self.remaining_server_hello >= 79 {
-                let session_id_len = data[43] as usize;
-                let cipher_index = 43 + session_id_len + 1;
-                if cipher_index + 1 < data.len() {
-                    self.cipher = ((data[cipher_index] as u16) << 8) | data[cipher_index + 1] as u16;
-                    info!(
-                        "Vision: Server Hello detected, cipher=0x{:04x} dest={}",
-                        self.cipher, self.inner.destination
-                    );
-                }
-            }
-        }
-        // Check for Client Hello
-        else if data.starts_with(&TLS_CLIENT_HANDSHAKE_START) && data[5] == 0x01 {
-            self.is_tls = true;
-            info!("Vision: Client Hello detected dest={}", self.inner.destination);
-        }
-
-        // Check for TLS 1.3 in Server Hello
-        if self.remaining_server_hello > 0 {
-            let end = (self.remaining_server_hello as usize).min(data.len());
-            self.remaining_server_hello -= end as i32;
-
-            if data[..end]
-                .windows(TLS13_SUPPORTED_VERSIONS.len())
-                .any(|w| w == TLS13_SUPPORTED_VERSIONS)
-            {
-                self.enable_xtls = matches!(self.cipher, 0x1301 | 0x1302 | 0x1303 | 0x1304);
-                info!(
-                    "Vision: TLS 1.3 detected! cipher=0x{:04x} enable_xtls={} dest={}",
-                    self.cipher, self.enable_xtls, self.inner.destination
-                );
-                self.number_of_packet_to_filter = 0;
-            } else if self.remaining_server_hello == 0 {
-                info!(
-                    "Vision: Server Hello complete, TLS 1.2. cipher=0x{:04x} dest={}",
-                    self.cipher, self.inner.destination
-                );
-                self.number_of_packet_to_filter = 0;
-            }
-        }
-    }
-
-    // Reshape buffer for Vision framing (sing-box reshapeBuffer)
     fn reshape_buffer(data: &[u8]) -> Vec<&[u8]> {
         const BUFFER_LIMIT: usize = 8192 - 21;
         if data.len() < BUFFER_LIMIT {
             return vec![data];
         }
 
-        // Try to split at TLS Application Data boundary
         let split = data
             .windows(TLS_APPLICATION_DATA_START.len())
             .rposition(|w| w == TLS_APPLICATION_DATA_START)
             .filter(|i| *i > 0)
             .unwrap_or(8192 / 2)
             .min(data.len());
-        
         vec![&data[..split], &data[split..]]
     }
 
-    // Create Vision padding frame (sing-box padding func)
+    fn filter_tls_buffers(&mut self, buffers: &[&[u8]]) {
+        for buffer in buffers {
+            if self.number_of_packet_to_filter <= 0 {
+                return;
+            }
+            self.number_of_packet_to_filter -= 1;
+            
+            let head = buffer
+                .iter()
+                .take(16)
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join("");
+            info!(
+                "Vision: filtering packet len={} head={} filter_left={} dest={}",
+                buffer.len(),
+                head,
+                self.number_of_packet_to_filter,
+                self.inner.destination
+            );
+
+            if buffer.len() > 6 {
+                if buffer.starts_with(&TLS_SERVER_HANDSHAKE_START) {
+                    self.is_tls = true;
+                    info!(
+                        "Vision: Server Hello detected. byte[5]=0x{:02x} dest={}",
+                        buffer[5],
+                        self.inner.destination
+                    );
+                    if buffer[5] == 0x02 {
+                        self.is_tls12_or_above = true;
+                        self.remaining_server_hello =
+                            (((buffer[3] as i32) << 8) | buffer[4] as i32) + 5;
+
+                        if buffer.len() >= 79 && self.remaining_server_hello >= 79 {
+                            let session_id_len = buffer[43] as usize;
+                            let cipher_index = 43 + session_id_len + 1;
+                            if cipher_index + 1 < buffer.len() {
+                                self.cipher = ((buffer[cipher_index] as u16) << 8)
+                                    | buffer[cipher_index + 1] as u16;
+                                info!(
+                                    "Vision: Cipher suite detected: 0x{:04x} dest={}",
+                                    self.cipher,
+                                    self.inner.destination
+                                );
+                            }
+                        }
+                    }
+                } else if buffer.starts_with(&TLS_CLIENT_HANDSHAKE_START)
+                    && buffer[5] == 0x01
+                {
+                    self.is_tls = true;
+                    info!(
+                        "Vision: Client Hello detected. dest={}",
+                        self.inner.destination
+                    );
+                }
+            }
+
+            if self.remaining_server_hello > 0 {
+                let end = (self.remaining_server_hello as usize).min(buffer.len());
+                self.remaining_server_hello -= end as i32;
+
+                if buffer[..end]
+                    .windows(TLS13_SUPPORTED_VERSIONS.len())
+                    .any(|w| w == TLS13_SUPPORTED_VERSIONS)
+                {
+                    self.enable_xtls =
+                        matches!(self.cipher, 0x1301 | 0x1302 | 0x1303 | 0x1304);
+                    info!(
+                        "Vision: TLS 1.3 detected! cipher=0x{:04x} enable_xtls={} dest={}",
+                        self.cipher,
+                        self.enable_xtls,
+                        self.inner.destination
+                    );
+                    self.number_of_packet_to_filter = 0;
+                    return;
+                }
+
+                if self.remaining_server_hello == 0 {
+                    info!(
+                        "Vision: Server Hello fully processed. cipher=0x{:04x} is_tls={} is_tls12_plus={} dest={}",
+                        self.cipher,
+                        self.is_tls,
+                        self.is_tls12_or_above,
+                        self.inner.destination
+                    );
+                    self.number_of_packet_to_filter = 0;
+                    return;
+                }
+            }
+        }
+    }
+
     fn padding_frame(&mut self, content: &[u8], command: u8) -> BytesMut {
         let content_len = content.len().min(u16::MAX as usize);
         let padding_len = if content_len < 900 && self.is_tls {
-            let random = (rand::random::<u16>() % 500) as usize;
-            (900 - content_len).min(u16::MAX as usize - random) + random
+            ((rand::random::<u16>() % 500) as usize) + (900 - content_len)
         } else {
             (rand::random::<u8>() as usize) % 256
         };
 
-        let mut frame = BytesMut::with_capacity(16 + 1 + 2 + 2 + content_len + padding_len);
-        
-        // UUID (only first frame)
+        let mut framed = BytesMut::with_capacity(
+            (if self.write_uuid { 16 } else { 0 }) + 5 + content_len + padding_len,
+        );
         if self.write_uuid {
-            frame.extend_from_slice(&self.uuid);
+            framed.extend_from_slice(self.inner.uuid.as_bytes());
             self.write_uuid = false;
         }
 
-        // Command + lengths
-        frame.put_u8(command);
-        frame.put_u16(content_len as u16);
-        frame.put_u16(padding_len as u16);
-        
-        // Content
-        frame.extend_from_slice(&content[..content_len]);
-        
-        // Padding
+        framed.put_u8(command);
+        framed.put_u16(content_len as u16);
+        framed.put_u16(padding_len as u16);
+        debug!(
+            "vision padding frame: command=0x{:02x} content={} padding={} is_tls={}",
+            command, content_len, padding_len, self.is_tls
+        );
+        framed.extend_from_slice(&content[..content_len]);
         if padding_len > 0 {
-            let mut padding = vec![0u8; padding_len];
-            for byte in &mut padding {
-                *byte = rand::random();
-            }
-            frame.extend_from_slice(&padding);
+            framed.resize(framed.len() + padding_len, 0);
         }
-
-        frame
+        framed
     }
 
-    // Make write pending struct (sing-box Write logic)
-    fn make_write_pending(&mut self, data: &[u8]) -> WritePending {
-        // Filter TLS BEFORE padding logic (sing-box line 193-195)
+    fn make_write_pending(&mut self, data: &[u8]) -> VisionWritePending {
         if self.number_of_packet_to_filter > 0 {
-            self.filter_tls(data);
+            self.filter_tls_buffers(&[data]);
         }
 
-        if !self.is_padding {
-            // After padding ended, write directly
-            return WritePending {
-                orig_len: data.len(),
-                data: BytesMut::from(data),
-                pos: 0,
-                switch_to_direct: false,
-                switch_done: false,
-                raw_tail: BytesMut::new(),
-                raw_tail_pos: 0,
-                sleep: None,
-            };
-        }
-
-        // Reshape and frame buffers
         let slices = Self::reshape_buffer(data);
-        let mut framed = BytesMut::new();
-        let mut spec_index = None;
-        let mut switch_to_direct = false;
+        let mut framed_prefix = Vec::new();
+        let mut raw_start = slices.len();
+        let mut direct_switch = false;
 
-        for (i, slice) in slices.iter().enumerate() {
-            // Check for TLS Application Data
-            if self.is_tls && slice.len() > 6 && slice.starts_with(&TLS_APPLICATION_DATA_START) {
-                let command = if self.enable_xtls {
+        for (index, slice) in slices.iter().enumerate() {
+            let slice_head = slice
+                .iter()
+                .take(5)
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join("");
+            debug!(
+                "vision write slice: len={} head={} is_tls={} tls12_plus={} filter_left={} enable_xtls={}",
+                slice.len(),
+                slice_head,
+                self.is_tls,
+                self.is_tls12_or_above,
+                self.number_of_packet_to_filter,
+                self.enable_xtls
+            );
+            if self.is_tls
+                && slice.len() > 6
+                && slice.starts_with(&TLS_APPLICATION_DATA_START)
+            {
+                let mut command = COMMAND_PADDING_END;
+                if self.enable_xtls {
+                    command = COMMAND_PADDING_DIRECT;
                     self.write_direct = true;
-                    switch_to_direct = true;
-                    spec_index = Some(i);
-                    COMMAND_PADDING_DIRECT
-                } else {
-                    COMMAND_PADDING_END
-                };
-                
+                    direct_switch = true;
+                }
                 info!(
-                    "Vision: TLS AppData detected, ending padding. command=0x{:02x} enable_xtls={} dest={}",
-                    command, self.enable_xtls, self.inner.destination
+                    "Vision: TLS AppData detected, ending padding mode. command=0x{:02x} enable_xtls={} dest={}",
+                    command,
+                    self.enable_xtls,
+                    self.inner.destination
                 );
-                
                 self.is_padding = false;
-                framed.extend_from_slice(&self.padding_frame(slice, command));
-                spec_index = Some(i);
+                raw_start = index + 1;
+                framed_prefix.push(self.padding_frame(slice, command));
                 break;
             }
-            // Check for fallback (non-TLS or TLS < 1.2)
-            else if !self.is_tls12_or_above && self.number_of_packet_to_filter <= 1 {
+
+            if !self.is_tls12_or_above && self.number_of_packet_to_filter <= 1 {
                 info!(
                     "Vision: fallback end (non-TLS or TLS<1.2). is_tls={} dest={}",
-                    self.is_tls, self.inner.destination
+                    self.is_tls,
+                    self.inner.destination
                 );
                 self.is_padding = false;
-                framed.extend_from_slice(&self.padding_frame(slice, COMMAND_PADDING_END));
-                spec_index = Some(i);
+                raw_start = index + 1;
+                framed_prefix.push(self.padding_frame(slice, COMMAND_PADDING_END));
                 break;
             }
-            
-            framed.extend_from_slice(&self.padding_frame(slice, COMMAND_PADDING_CONTINUE));
+
+            framed_prefix.push(self.padding_frame(slice, COMMAND_PADDING_CONTINUE));
         }
 
-        // Collect raw_tail (data after PADDING_DIRECT/END)
+        let total = framed_prefix.iter().map(BytesMut::len).sum();
+        let mut framed = BytesMut::with_capacity(total);
+        for frame in framed_prefix {
+            framed.extend_from_slice(&frame);
+        }
+
         let mut raw_tail = BytesMut::new();
-        if let Some(idx) = spec_index {
-            if idx + 1 < slices.len() {
-                for slice in &slices[idx + 1..] {
-                    raw_tail.extend_from_slice(slice);
-                }
+        if raw_start < slices.len() {
+            let remaining =
+                slices[raw_start..].iter().map(|slice| slice.len()).sum();
+            raw_tail.reserve(remaining);
+            for slice in &slices[raw_start..] {
+                raw_tail.extend_from_slice(slice);
             }
         }
 
-        WritePending {
+        VisionWritePending {
             orig_len: data.len(),
-            data: framed,
-            pos: 0,
-            switch_to_direct,
+            framed,
+            framed_pos: 0,
+            switch_to_raw: direct_switch,
             switch_done: false,
             raw_tail,
             raw_tail_pos: 0,
-            sleep: None,
+            raw_tail_sleep: None,
         }
     }
 
     fn poll_write_pending(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<usize, io::Error>> {
-        let pending = self.write_pending.as_mut().unwrap();
+    ) -> Poll<io::Result<usize>> {
+        let Some(pending) = self.write_pending.as_mut() else {
+            return Poll::Ready(Ok(0));
+        };
 
-        // Write framed data
-        while pending.pos < pending.data.len() {
-            match Pin::new(&mut self.inner).poll_write(cx, &pending.data[pending.pos..]) {
+        while pending.framed_pos < pending.framed.len() {
+            match Pin::new(&mut self.inner)
+                .poll_write(cx, &pending.framed[pending.framed_pos..])
+            {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
-                        "write zero in Vision framed write",
+                        "write zero while writing Vision framed data",
                     )));
                 }
-                Poll::Ready(Ok(n)) => pending.pos += n,
+                Poll::Ready(Ok(n)) => pending.framed_pos += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
         }
 
-        // Switch to direct write mode for XTLS
-        if pending.switch_to_direct && !pending.switch_done {
-            // Flush before switching
+        if pending.switch_to_raw && !pending.switch_done {
             match Pin::new(&mut self.inner).poll_flush(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
-
-            // Switch Reality to raw write mode
-            let switched = switch_reality_raw_modes(&mut self.inner.inner, false, true)?;
-            debug!("Vision: switched to raw write mode, switched={}", switched);
+            let switched =
+                switch_reality_raw_modes(&mut self.inner.inner, false, true)?;
+            debug!("vision direct write switch: switched={switched}");
             pending.switch_done = true;
-
-            // Create sleep if we have raw_tail data
+            
+            // If we have raw_tail data, create a sleep timer to give server time to switch
             if !pending.raw_tail.is_empty() {
                 info!(
-                    "Vision: sleeping 5ms before raw_tail write. tail_len={} dest={}",
-                    pending.raw_tail.len(),
+                    "Vision: switched to raw write, sleeping 5ms before raw_tail. dest={}",
                     self.inner.destination
                 );
-                pending.sleep = Some(Box::pin(sleep(Duration::from_millis(5))));
+                pending.raw_tail_sleep = Some(Box::pin(sleep(Duration::from_millis(5))));
             }
         }
 
-        // Wait for sleep
-        if let Some(ref mut sleep_fut) = pending.sleep {
+        // Wait for sleep if we have raw_tail data after DIRECT command
+        if let Some(ref mut sleep_fut) = pending.raw_tail_sleep {
             match sleep_fut.as_mut().poll(cx) {
                 Poll::Ready(()) => {
-                    pending.sleep = None;
+                    pending.raw_tail_sleep = None; // Sleep done
                 }
                 Poll::Pending => return Poll::Pending,
             }
         }
 
-        // Write raw_tail
         while pending.raw_tail_pos < pending.raw_tail.len() {
             match Pin::new(&mut self.inner)
                 .poll_write(cx, &pending.raw_tail[pending.raw_tail_pos..])
@@ -673,7 +693,7 @@ impl VisionStream {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
-                        "write zero in Vision raw_tail write",
+                        "write zero while writing Vision raw tail",
                     )));
                 }
                 Poll::Ready(Ok(n)) => pending.raw_tail_pos += n,
@@ -687,157 +707,236 @@ impl VisionStream {
         Poll::Ready(Ok(ack))
     }
 
-    // Parse Vision frames from read_pending
+    fn finish_read_block(&mut self) -> io::Result<()> {
+        debug!(
+            "vision finish block: command=0x{:02x} read_padding={}",
+            self.read_current_command, self.read_padding
+        );
+        match self.read_current_command {
+            COMMAND_PADDING_CONTINUE => {}
+            COMMAND_PADDING_END => {
+                info!(
+                    "Vision read: PADDING_END received, switching to raw mode. dest={}",
+                    self.inner.destination
+                );
+                self.read_padding = false;
+            }
+            COMMAND_PADDING_DIRECT => {
+                info!(
+                    "Vision read: PADDING_DIRECT received, switching to XTLS raw. dest={}",
+                    self.inner.destination
+                );
+                self.read_padding = false;
+                let switched =
+                    switch_reality_raw_modes(&mut self.inner.inner, true, false)?;
+                let pending_head = self
+                    .read_pending
+                    .iter()
+                    .take(8)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join("");
+                debug!(
+                    "vision direct read switch: switched={} pending={} pending_head={}",
+                    switched,
+                    self.read_pending.len(),
+                    pending_head
+                );
+            }
+            command => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Unknown Vision frame type: 0x{command:02x}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn parse_read_pending(&mut self) -> io::Result<bool> {
         loop {
-            // If not in padding mode, return all pending data
-            if !self.within_padding_buffers {
+            if !self.read_padding {
                 if !self.read_pending.is_empty() {
-                    // Filter TLS on read
+                    let raw = self.read_pending.split_to(self.read_pending.len());
                     if self.number_of_packet_to_filter > 0 {
-                        let data_copy = self.read_pending.clone();
-                        self.filter_tls(&data_copy);
+                        self.filter_tls_buffers(&[raw.as_ref()]);
                     }
-                    let data = self.read_pending.split_to(self.read_pending.len());
-                    self.read_buf.extend_from_slice(&data);
+                    self.read_buf.extend_from_slice(&raw);
                     return Ok(true);
                 }
                 return Ok(!self.read_buf.is_empty());
             }
 
-            // Need frame header: [UUID(16)][Command(1)][ContentLen(2)][PaddingLen(2)]
-            if self.remaining_content == -1 && self.remaining_padding == -1 {
-                // Check if we have enough data for UUID check (first frame only)
+            if self.read_remaining_content == -1 && self.read_remaining_padding == -1
+            {
+                // Check if this is a Vision frame (starts with UUID)
+                // Need at least 21 bytes: UUID(16) + command(1) + content_len(2) + padding_len(2)
+                // But if we have 16+ bytes and UUID doesn't match, it's raw data
                 if self.read_pending.len() >= 16 {
-                    // Check UUID mismatch -> raw data
-                    if self.read_pending[..16] != self.uuid {
+                    if self.read_pending[..16] != *self.inner.uuid.as_bytes() {
+                        // UUID doesn't match - this is raw data, not Vision
+                        let head = self.read_pending.iter().take(16)
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<Vec<_>>()
+                            .join("");
                         info!(
-                            "Vision: UUID mismatch, raw data detected. dest={}",
+                            "Vision read: UUID mismatch, treating as raw data. head={} dest={}",
+                            head,
                             self.inner.destination
                         );
-                        self.within_padding_buffers = false;
+                        self.read_padding = false;
                         continue;
                     }
+                    // UUID matches - wait for full header if needed
+                    if self.read_pending.len() < 21 {
+                        return Ok(!self.read_buf.is_empty());
+                    }
+                    self.read_pending.advance(16);
+                    self.read_current_command = COMMAND_PADDING_CONTINUE;
+                    self.read_remaining_content = 0;
+                    self.read_remaining_padding = 0;
+                } else {
+                    // Not enough data to check UUID - wait for more
+                    return Ok(!self.read_buf.is_empty());
+                }
+            }
+
+            if self.read_remaining_content <= 0 && self.read_remaining_padding <= 0 {
+                if self.read_current_command == COMMAND_PADDING_END
+                    || self.read_current_command == COMMAND_PADDING_DIRECT
+                {
+                    self.finish_read_block()?;
+                    continue;
                 }
 
-                // Need at least 21 bytes for full header
-                if self.read_pending.len() < 21 {
+                if self.read_pending.len() < 5 {
                     return Ok(!self.read_buf.is_empty());
                 }
 
-                // Parse header
-                self.read_pending.advance(16); // Skip UUID
-                self.current_command = self.read_pending[0];
-                self.remaining_content = ((self.read_pending[1] as i32) << 8) | self.read_pending[2] as i32;
-                self.remaining_padding = ((self.read_pending[3] as i32) << 8) | self.read_pending[4] as i32;
+                let header_hex = self.read_pending[..5]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join("");
+                self.read_current_command = self.read_pending[0];
+                self.read_remaining_content = ((self.read_pending[1] as i32) << 8)
+                    | self.read_pending[2] as i32;
+                self.read_remaining_padding = ((self.read_pending[3] as i32) << 8)
+                    | self.read_pending[4] as i32;
+                debug!(
+                    "vision read header: raw={} command=0x{:02x} content={} padding={}",
+                    header_hex,
+                    self.read_current_command,
+                    self.read_remaining_content,
+                    self.read_remaining_padding
+                );
                 self.read_pending.advance(5);
 
-                debug!(
-                    "Vision: frame header parsed. cmd=0x{:02x} content={} padding={} dest={}",
-                    self.current_command, self.remaining_content, self.remaining_padding, self.inner.destination
-                );
+                if self.read_remaining_content <= 0
+                    && self.read_remaining_padding <= 0
+                {
+                    self.finish_read_block()?;
+                    continue;
+                }
             }
 
-            // Read content
-            if self.remaining_content > 0 {
+            if self.read_remaining_content > 0 {
                 if self.read_pending.is_empty() {
                     return Ok(!self.read_buf.is_empty());
                 }
 
-                let take = (self.remaining_content as usize).min(self.read_pending.len());
+                let take = (self.read_remaining_content as usize)
+                    .min(self.read_pending.len());
                 let data = self.read_pending.split_to(take);
-                self.remaining_content -= take as i32;
+                self.read_remaining_content -= take as i32;
 
-                // Filter TLS on content
                 if self.number_of_packet_to_filter > 0 {
-                    let data_copy = data.clone();
-                    self.filter_tls(&data_copy);
+                    self.filter_tls_buffers(&[data.as_ref()]);
                 }
 
-                self.read_buf.extend_from_slice(&data);
+                let head = data
+                    .iter()
+                    .take(8)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join("");
+                let full = if data.len() <= 64 {
+                    data.iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join("")
+                } else {
+                    String::new()
+                };
+                if self.read_current_command == COMMAND_PADDING_DIRECT {
+                    debug!(
+                        "vision direct content chunk: len={} head={} full={}",
+                        data.len(),
+                        head,
+                        full
+                    );
+                } else {
+                    debug!(
+                        "vision content chunk: command=0x{:02x} len={} head={} full={}",
+                        self.read_current_command,
+                        data.len(),
+                        head,
+                        full
+                    );
+                }
+
+                if !data.is_empty() {
+                    self.read_buf.extend_from_slice(&data);
+                }
+                continue;
             }
 
-            // Skip padding
-            if self.remaining_padding > 0 {
+            if self.read_remaining_padding > 0 {
                 if self.read_pending.is_empty() {
                     return Ok(!self.read_buf.is_empty());
                 }
 
-                let skip = (self.remaining_padding as usize).min(self.read_pending.len());
+                let skip = (self.read_remaining_padding as usize)
+                    .min(self.read_pending.len());
                 self.read_pending.advance(skip);
-                self.remaining_padding -= skip as i32;
-            }
+                self.read_remaining_padding -= skip as i32;
 
-            // Frame complete, process command
-            if self.remaining_content == 0 && self.remaining_padding == 0 {
-                match self.current_command {
-                    COMMAND_PADDING_CONTINUE => {
-                        self.within_padding_buffers = true;
-                    }
-                    COMMAND_PADDING_END => {
-                        info!("Vision: PADDING_END received, switching to raw. dest={}", self.inner.destination);
-                        self.within_padding_buffers = false;
-                    }
-                    COMMAND_PADDING_DIRECT => {
-                        info!("Vision: PADDING_DIRECT received, switching to XTLS raw. dest={}", self.inner.destination);
-                        self.within_padding_buffers = false;
-                        self.direct_read = true;
-                        // TODO: read input/rawInput from TLS conn if available
-                    }
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("Unknown Vision command: 0x{:02x}", self.current_command),
-                        ));
-                    }
+                if self.read_remaining_content <= 0
+                    && self.read_remaining_padding <= 0
+                {
+                    self.finish_read_block()?;
                 }
-
-                self.remaining_content = -1;
-                self.remaining_padding = -1;
             }
         }
     }
 
     async fn fill_read_buf(&mut self) -> io::Result<()> {
         loop {
-            // Try to parse what we have
             if self.parse_read_pending()? {
                 return Ok(());
             }
 
-            // If direct_read mode, read from Reality raw
-            if self.direct_read {
-                // Switch Reality to raw read mode
-                switch_reality_raw_modes(&mut self.inner.inner, true, false)?;
-                
-                let mut tmp = [0u8; 8192];
-                let n = tokio::io::AsyncReadExt::read(&mut self.inner, &mut tmp).await?;
-                if n == 0 {
-                    return Ok(());
-                }
-                
-                debug!("Vision: direct_read mode, read {} bytes", n);
-                self.read_buf.extend_from_slice(&tmp[..n]);
-                return Ok(());
-            }
-
-            // Read more data
             let mut tmp = [0u8; 8192];
             let n = tokio::io::AsyncReadExt::read(&mut self.inner, &mut tmp).await?;
             if n == 0 {
-                // EOF, process remaining
                 if !self.read_pending.is_empty() {
+                    let left = self.read_pending.split_to(self.read_pending.len());
                     if self.number_of_packet_to_filter > 0 {
-                        let data_copy = self.read_pending.clone();
-                        self.filter_tls(&data_copy);
+                        self.filter_tls_buffers(&[left.as_ref()]);
                     }
-                    let data = self.read_pending.split_to(self.read_pending.len());
-                    self.read_buf.extend_from_slice(&data);
+                    self.read_buf.extend_from_slice(&left);
                 }
                 return Ok(());
             }
-
-            debug!("Vision: read {} bytes from inner", n);
+            debug!(
+                "vision fill_read_buf: inner_read={} pending_before={} padding={} cmd=0x{:02x} rem_content={} rem_padding={}",
+                n,
+                self.read_pending.len(),
+                self.read_padding,
+                self.read_current_command,
+                self.read_remaining_content,
+                self.read_remaining_padding
+            );
             self.read_pending.extend_from_slice(&tmp[..n]);
         }
     }
@@ -859,8 +958,31 @@ impl AsyncRead for VisionStream {
             }
         }
 
-        if self.read_buf.is_empty() {
-            return Poll::Ready(Ok(()));
+        // Try to greedily complete an in-progress padding block when data is
+        // already available, to avoid long stalls between partial chunks.
+        loop {
+            let need_more = self.read_padding
+                && self.read_pending.is_empty()
+                && (self.read_remaining_content > 0
+                    || self.read_remaining_padding > 0);
+            if !need_more || self.read_buf.len() >= buf.remaining() {
+                break;
+            }
+            let before = self.read_buf.len();
+            let poll_result = {
+                let fut = self.fill_read_buf();
+                tokio::pin!(fut);
+                fut.poll(cx)
+            };
+            match poll_result {
+                Poll::Ready(Ok(())) => {
+                    if self.read_buf.len() == before {
+                        break;
+                    }
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => break,
+            }
         }
 
         let to_copy = self.read_buf.len().min(buf.remaining());
@@ -885,23 +1007,20 @@ impl AsyncWrite for VisionStream {
             return self.poll_write_pending(cx);
         }
 
-        // After padding ends, check if we should write directly
-        if !self.is_padding {
-            // Filter TLS on write BEFORE padding check
-            if self.number_of_packet_to_filter > 0 {
-                self.filter_tls(buf);
-            }
+        // After padding ends, stop filtering - handshake is complete
+        // Filtering application data breaks TLS and causes connection hangs
 
-            if self.write_direct {
-                // Write directly to raw Reality
-                debug!("Vision: direct write mode, len={}", buf.len());
-                return Pin::new(&mut self.inner).poll_write(cx, buf);
-            }
+        if self.write_direct {
+            let head = buf
+                .iter()
+                .take(8)
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join("");
+            debug!("vision raw write: len={} head={}", buf.len(), head);
         }
 
-        // Create write pending
-        self.write_pending = Some(self.make_write_pending(buf));
-        self.poll_write_pending(cx)
+        Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
     fn poll_flush(
