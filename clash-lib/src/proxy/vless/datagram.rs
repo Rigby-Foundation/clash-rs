@@ -233,12 +233,20 @@ impl OutboundDatagramVlessXudp {
 
         let status = self.read_buf[4];
         let option = self.read_buf[5];
+
+        // ЖЕСТКИЙ ЛОГ ДЛЯ ДЕБАГА
+        tracing::info!(
+            "XUDP RX [RAW]: frame_len={}, status={}, option={}, buf_size={}",
+            frame_len, status, option, self.read_buf.len()
+        );
+
         let mut source = self.destination.clone();
         let mut payload_len = 0usize;
         let mut consumed = 6usize;
 
         match status {
             XUDP_STATUS_END => {
+                tracing::warn!("XUDP RX: Server sent StatusEnd (Connection closed by remote)");
                 if self.read_buf.len() < 2 + frame_len { return Ok(XudpDecodeResult::NeedMore); }
                 self.read_buf.advance(2 + frame_len);
                 return Ok(XudpDecodeResult::End);
@@ -265,14 +273,19 @@ impl OutboundDatagramVlessXudp {
                     consumed += tail_len;
                 }
             }
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported xudp status")),
+            _ => {
+                tracing::error!("XUDP RX: Unknown status {}", status);
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported xudp status"));
+            }
         }
 
         if option & XUDP_OPTION_ERROR != 0 {
+            tracing::warn!("XUDP RX: Server sent OptionError");
             self.read_buf.advance(consumed);
             return Ok(XudpDecodeResult::End);
         }
         if option & XUDP_OPTION_DATA == 0 || payload_len == 0 {
+            tracing::info!("XUDP RX: Skipping empty packet");
             self.read_buf.advance(consumed);
             return Ok(XudpDecodeResult::Skip);
         }
@@ -280,6 +293,8 @@ impl OutboundDatagramVlessXudp {
         if self.read_buf.len() < consumed + payload_len { return Ok(XudpDecodeResult::NeedMore); }
         let payload = self.read_buf[consumed..consumed + payload_len].to_vec();
         self.read_buf.advance(consumed + payload_len);
+
+        tracing::info!("XUDP RX: SUCCESS! Extracted {} bytes from {}", payload.len(), source);
         Ok(XudpDecodeResult::Packet(UdpPacket { data: payload, src_addr: source, dst_addr: SocksAddr::any_ipv4() }))
     }
 }
