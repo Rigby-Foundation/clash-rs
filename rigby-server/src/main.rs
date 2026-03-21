@@ -20,6 +20,10 @@ struct Args {
     #[arg(long = "generate-key")]
     generate_key: bool,
 
+    /// Generate Reality TLS keys and exit
+    #[arg(long = "generate-reality")]
+    generate_reality: bool,
+
     /// Enable padding (default: true)
     #[arg(long = "padding", default_value = "true")]
     padding: bool,
@@ -30,6 +34,39 @@ fn generate_x25519_keypair() -> ([u8; 32], [u8; 32]) {
     let private_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
     let public_key = x25519_dalek::PublicKey::from(&private_key);
     (private_key.to_bytes(), public_key.to_bytes())
+}
+
+fn generate_reality_config() -> (String, String) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    
+    // Generate Reality private/public keypair (also x25519)
+    let (priv_key, pub_key) = generate_x25519_keypair();
+    
+    // Generate short ID (random hex string 2-16 chars)
+    let short_id_len = rng.gen_range(8..=16);
+    let short_id: String = (0..short_id_len)
+        .map(|_| format!("{:x}", rng.gen::<u8>() & 0xf))
+        .collect();
+    
+    let public_key_b64 = general_purpose::URL_SAFE_NO_PAD.encode(pub_key);
+    let private_key_b64 = general_purpose::URL_SAFE_NO_PAD.encode(priv_key);
+    
+    println!("🔐 Generated Reality TLS Configuration:");
+    println!();
+    println!("Public Key (for clients):  {}", public_key_b64);
+    println!("Private Key (for server):  {}", private_key_b64);
+    println!("Short ID:                  {}", short_id);
+    println!();
+    println!("Client Reality URL:");
+    println!("  rigby://RIGBY_PUBLIC_KEY@18.171.159.227:8444?reality_pk={}&reality_sid={}&fp=chrome&alpn=h2,http/1.1", 
+             public_key_b64, short_id);
+    println!();
+    println!("Server Reality Config (save this):");
+    println!("  reality_private_key: {}", private_key_b64);
+    println!("  reality_short_id: {}", short_id);
+    
+    (public_key_b64, short_id)
 }
 
 fn decode_key(encoded: &str) -> Result<[u8; 32], String> {
@@ -78,7 +115,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  rigby-server --server-key {}", private_b64);
         println!();
         println!("Client URI:");
-        println!("  rigby://{}@your.server.com:8444", public_b64);
+        println!("  rigby://{}@18.171.159.227:8444", public_b64);
+        return Ok(());
+    }
+
+    if args.generate_reality {
+        generate_reality_config();
         return Ok(());
     }
 
