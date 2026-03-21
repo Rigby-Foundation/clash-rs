@@ -124,9 +124,9 @@ impl RigbyRealityTransport {
         if let Some(ref mut client) = self.reality_client {
             if !self.handshake_done {
                 // During handshake, Reality handles the wrapping
-                // Store cleartext for later
+                // Store cleartext for later, but still send the handshake data
                 self.pending_cleartext.extend_from_slice(data);
-                return Ok(Vec::new()); // Don't send yet
+                return Ok(data.to_vec()); // Send handshake data directly
             }
 
             // Post-handshake: wrap as TLS Application Data
@@ -540,14 +540,12 @@ impl RigbyClientConnection {
         
         // Wrap handshake message as TLS record if Reality is enabled
         let wrapped_hs = reality_transport.wrap_as_tls_record(&hs_msg[..hs_len])?;
-        if !wrapped_hs.is_empty() {
-            sink.send(UdpPacket::new(
-                wrapped_hs,
-                SocksAddr::any_ipv4(),
-                destination.clone(),
-            ))
-            .await?;
-        }
+        sink.send(UdpPacket::new(
+            wrapped_hs,
+            SocksAddr::any_ipv4(),
+            destination.clone(),
+        ))
+        .await?;
 
         let response = tokio::time::timeout(CLIENT_HANDSHAKE_TIMEOUT, stream.next())
             .await
