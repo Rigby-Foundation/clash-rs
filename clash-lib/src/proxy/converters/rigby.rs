@@ -39,6 +39,9 @@ impl TryFrom<OutboundRigby> for Handler {
     type Error = Error;
 
     fn try_from(value: OutboundRigby) -> Result<Self, Self::Error> {
+        tracing::error!("🐛 RIGBY CONVERTER: Attempting to create handler for {}", value.common_opts.name);
+        tracing::error!("🐛 RIGBY CONVERTER: Server={}:{}, has_reality={}", 
+            value.common_opts.server, value.common_opts.port, value.reality_public_key.is_some());
         let server_static_pubkey =
             decode_key32(&value.server_static_pubkey, "rigby server-static-pubkey")?;
         let client_private_key = value
