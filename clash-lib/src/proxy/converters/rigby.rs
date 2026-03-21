@@ -72,7 +72,7 @@ impl TryFrom<OutboundRigby> for Handler {
             .transpose()?;
 
         tracing::error!("🐛 RIGBY CONVERTER: Step 5 - Creating handler");
-        Ok(Handler::new(HandlerOptions {
+        let handler = Handler::new(HandlerOptions {
             name: value.common_opts.name.clone(),
             common_opts: HandlerCommonOptions {
                 connector: value.common_opts.connect_via.clone(),
@@ -90,7 +90,7 @@ impl TryFrom<OutboundRigby> for Handler {
             reality_short_id,
             client_fingerprint: value.client_fingerprint,
             alpn: value.alpn,
-        }));
+        });
         tracing::error!("🐛 RIGBY CONVERTER: SUCCESS - Handler created!");
         Ok(handler)
     }
