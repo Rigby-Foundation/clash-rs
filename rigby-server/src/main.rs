@@ -1,163 +1,78 @@
 use clap::Parser;
-use std::{net::SocketAddr, str::FromStr};
-use base64::{engine::general_purpose, Engine as _};
-use clash_lib::proxy::rigby::{RigbyServer, RigbyServerConfig};
+use quinn::{Endpoint, ServerConfig};
+use std::{net::SocketAddr, sync::Arc};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream};
 
-/// Rigby Protocol Server with Reality TLS Steganography
+// Новые импорты для rustls 0.23
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
 #[derive(Parser)]
-#[command(name = "rigby-server")]
-#[command(about = "A rigby:3P protocol server that looks like Chrome HTTPS traffic")]
+#[command(name = "rigby-server", about = "Rigby Protocol QUIC Server (h3 stealth)")]
 struct Args {
-    /// Bind address and port (e.g., 0.0.0.0:8444)
     #[arg(short = 'b', long = "bind", default_value = "0.0.0.0:8444")]
     bind: String,
 
-    /// Server private key (32 bytes, base64 encoded)
-    #[arg(short = 's', long = "server-key")]
-    server_key: Option<String>,
-
-    /// Generate a new server key pair and exit
-    #[arg(long = "generate-key")]
-    generate_key: bool,
-
-    /// Generate Reality TLS keys and exit
-    #[arg(long = "generate-reality")]
-    generate_reality: bool,
-
-    /// Enable padding (default: true)
-    #[arg(long = "padding", default_value = "true")]
-    padding: bool,
-}
-
-fn generate_x25519_keypair() -> ([u8; 32], [u8; 32]) {
-    use rand::rngs::OsRng;
-    let private_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-    let public_key = x25519_dalek::PublicKey::from(&private_key);
-    (private_key.to_bytes(), public_key.to_bytes())
-}
-
-fn generate_reality_config() -> (String, String) {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    
-    // Generate Reality private/public keypair (also x25519)
-    let (priv_key, pub_key) = generate_x25519_keypair();
-    
-    // Generate short ID (random hex string 2-16 chars)
-    let short_id_len = rng.gen_range(8..=16);
-    let short_id: String = (0..short_id_len)
-        .map(|_| format!("{:x}", rng.gen::<u8>() & 0xf))
-        .collect();
-    
-    let public_key_b64 = general_purpose::URL_SAFE_NO_PAD.encode(pub_key);
-    let private_key_b64 = general_purpose::URL_SAFE_NO_PAD.encode(priv_key);
-    
-    println!("🔐 Generated Reality TLS Configuration:");
-    println!();
-    println!("Public Key (for clients):  {}", public_key_b64);
-    println!("Private Key (for server):  {}", private_key_b64);
-    println!("Short ID:                  {}", short_id);
-    println!();
-    println!("Client Reality URL:");
-    println!("  rigby://RIGBY_PUBLIC_KEY@18.171.159.227:8444?reality_pk={}&reality_sid={}&fp=chrome&alpn=h2,http/1.1", 
-             public_key_b64, short_id);
-    println!();
-    println!("Server Reality Config (save this):");
-    println!("  reality_private_key: {}", private_key_b64);
-    println!("  reality_short_id: {}", short_id);
-    
-    (public_key_b64, short_id)
-}
-
-fn decode_key(encoded: &str) -> Result<[u8; 32], String> {
-    let candidates = [
-        general_purpose::URL_SAFE_NO_PAD.decode(encoded).ok(),
-        general_purpose::URL_SAFE.decode(encoded).ok(), 
-        general_purpose::STANDARD_NO_PAD.decode(encoded).ok(),
-        general_purpose::STANDARD.decode(encoded).ok(),
-        hex::decode(encoded).ok(),
-    ];
-
-    for bytes in candidates.into_iter().flatten() {
-        if bytes.len() == 32 {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes);
-            return Ok(key);
-        }
-    }
-
-    Err("Invalid key format. Must be 32-byte key encoded as base64/base64url/hex".to_string())
+    #[arg(long = "sni", default_value = "www.google.com")]
+    sni: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
 
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("rigby_server=info".parse()?)
-                .add_directive("clash_lib::proxy::rigby=debug".parse()?)
-        )
-        .init();
+    let cert = rcgen::generate_simple_self_signed(vec![args.sni.clone()])?;
 
-    if args.generate_key {
-        let (private_key, public_key) = generate_x25519_keypair();
-        let private_b64 = general_purpose::URL_SAFE_NO_PAD.encode(&private_key);
-        let public_b64 = general_purpose::URL_SAFE_NO_PAD.encode(&public_key);
-        
-        println!("Generated Rigby Server Keypair:");
-        println!("Private Key: {}", private_b64);
-        println!("Public Key:  {}", public_b64);
-        println!();
-        println!("Server command:");
-        println!("  rigby-server --server-key {}", private_b64);
-        println!();
-        println!("Client URI:");
-        println!("  rigby://{}@18.171.159.227:8444", public_b64);
-        return Ok(());
+    // Адаптация под rustls 0.23 (pki_types)
+    let cert_der = CertificateDer::from(cert.serialize_der()?);
+    let priv_key = PrivateKeyDer::try_from(cert.serialize_private_key_der()).unwrap();
+
+    let mut crypto = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.into_owned()], priv_key)?;
+
+    crypto.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)?;
+    let server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
+    let bind_addr: SocketAddr = args.bind.parse()?;
+    let endpoint = Endpoint::server(server_config, bind_addr)?;
+
+    println!("🛡️ Rigby QUIC Server listening on {} (SNI: {})", bind_addr, args.sni);
+
+    while let Some(conn) = endpoint.accept().await {
+        tokio::spawn(async move {
+            let connection = match conn.await {
+                Ok(c) => c,
+                Err(e) => { tracing::error!("Connection failed: {}", e); return; }
+            };
+            tracing::info!("✅ Client connected!");
+
+            while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                tokio::spawn(async move {
+                    let target_len = match recv.read_u16().await {
+                        Ok(l) => l as usize,
+                        Err(_) => return,
+                    };
+                    let mut target_buf = vec![0u8; target_len];
+                    if recv.read_exact(&mut target_buf).await.is_err() { return; }
+
+                    let target_str = String::from_utf8_lossy(&target_buf[1..target_len-2]);
+                    let port = u16::from_be_bytes([target_buf[target_len-2], target_buf[target_len-1]]);
+                    let target = format!("{}:{}", target_str, port);
+
+                    tracing::info!("🔗 Proxying to: {}", target);
+
+                    if let Ok(mut upstream) = TcpStream::connect(&target).await {
+                        let (mut up_read, mut up_write) = upstream.split();
+                        let _ = tokio::try_join!(
+                            tokio::io::copy(&mut recv, &mut up_write),
+                            tokio::io::copy(&mut up_read, &mut send)
+                        );
+                    }
+                });
+            }
+        });
     }
-
-    if args.generate_reality {
-        generate_reality_config();
-        return Ok(());
-    }
-
-    let server_key = args.server_key
-        .as_deref()
-        .ok_or("Server key required. Use --generate-key to create one.")?;
-    
-    let private_key = decode_key(server_key)
-        .map_err(|e| format!("Invalid server key: {}", e))?;
-
-    let bind_addr = SocketAddr::from_str(&args.bind)
-        .map_err(|e| format!("Invalid bind address '{}': {}", args.bind, e))?;
-
-    let config = RigbyServerConfig {
-        bind_addr,
-        server_static_private_key: private_key,
-        padding: args.padding,
-    };
-
-    let public_key = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private_key));
-    let public_b64 = general_purpose::URL_SAFE_NO_PAD.encode(public_key.to_bytes());
-
-    println!("🐱 Starting Rigby Server (rigby:3P)");
-    println!("Bind Address: {}", bind_addr);
-    println!("Public Key:   {}", public_b64);
-    println!("Padding:      {}", args.padding);
-    println!();
-    println!("Client URI:   rigby://{}@{}:{}", 
-        public_b64, 
-        bind_addr.ip(),
-        bind_addr.port()
-    );
-    println!();
-    println!("Server ready! Listening for Reality-masked UDP traffic...");
-
-    let server = RigbyServer::new(config);
-    server.run().await?;
-
     Ok(())
 }
