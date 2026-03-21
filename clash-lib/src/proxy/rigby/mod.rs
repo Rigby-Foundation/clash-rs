@@ -485,6 +485,7 @@ impl RigbyClientConnection {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<Self> {
+        debug!("rigby: starting connection to {}:{}", opts.server, opts.port);
         let destination = SocksAddr::try_from((opts.server.clone(), opts.port))
             .map_err(|e| io::Error::other(e.to_string()))?;
         let mut datagram = connector
@@ -536,6 +537,7 @@ impl RigbyClientConnection {
         
         // Wrap handshake message as TLS record if Reality is enabled
         let wrapped_hs = reality_transport.wrap_as_tls_record(&hs_msg[..hs_len])?;
+        debug!("rigby: sending handshake {} bytes (wrapped: {})", hs_len, wrapped_hs.len());
         sink.send(UdpPacket::new(
             wrapped_hs,
             SocksAddr::any_ipv4(),
@@ -543,6 +545,7 @@ impl RigbyClientConnection {
         ))
         .await?;
 
+        debug!("rigby: waiting for handshake response...");
         let response = tokio::time::timeout(CLIENT_HANDSHAKE_TIMEOUT, stream.next())
             .await
             .map_err(|_| {
@@ -552,9 +555,11 @@ impl RigbyClientConnection {
                 io::Error::new(io::ErrorKind::UnexpectedEof, "rigby handshake eof")
             })?;
 
+        debug!("rigby: received handshake response {} bytes", response.data.len());
         // Unwrap TLS record to get raw handshake response
         let unwrapped_response = reality_transport.unwrap_tls_record(&response.data)?;
         
+        debug!("rigby: unwrapped response {} bytes", unwrapped_response.len());
         let mut hs_buf = vec![0u8; 2048];
         hs.read_message(&unwrapped_response, &mut hs_buf)
             .map_err(|e| io::Error::other(format!("rigby handshake failed: {e}")))?;
@@ -564,6 +569,7 @@ impl RigbyClientConnection {
 
         // Mark handshake done
         reality_transport.mark_handshake_done();
+        debug!("rigby: handshake complete, starting data loop");
 
         let streams: Arc<RwLock<HashMap<u16, mpsc::Sender<Vec<u8>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -592,6 +598,7 @@ impl RigbyClientConnection {
                 tokio::select! {
                     maybe_frame = outgoing_rx.recv() => {
                         let Some(frame) = maybe_frame else { break };
+                        debug!("rigby: sending frame stream_id={} kind={:?}", frame.stream_id, frame.kind);
                         if let Err(e) = send_encrypted_frame_with_reality(
                             &mut sink,
                             &mut transport,
@@ -607,8 +614,12 @@ impl RigbyClientConnection {
                         }
                     }
                     maybe_pkt = stream.next() => {
-                        let Some(pkt) = maybe_pkt else { break };
+                        let Some(pkt) = maybe_pkt else { 
+                            debug!("rigby: stream ended");
+                            break 
+                        };
                         
+                        debug!("rigby: received packet {} bytes", pkt.data.len());
                         // Unwrap TLS record first
                         let unwrapped_data = {
                             let mut reality = reality_for_recv.lock().await;
