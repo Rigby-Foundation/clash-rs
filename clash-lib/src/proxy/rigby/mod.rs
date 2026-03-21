@@ -94,7 +94,7 @@ struct RigbyRealityTransport {
 impl RigbyRealityTransport {
     fn new(reality_config: Option<RealityConfig>, sni: Option<String>) -> io::Result<Self> {
         let reality_client = if let (Some(config), Some(sni)) = (reality_config, sni) {
-            let root_store: RootCertStore = 
+            let root_store: RootCertStore =
                 webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
             let mut tls_config = ClientConfig::builder()
                 .with_root_certificates(Arc::new(root_store))
@@ -132,7 +132,7 @@ impl RigbyRealityTransport {
             tls_record.extend_from_slice(&TLS_VERSION_1_3);
             tls_record.extend_from_slice(&(data.len() as u16).to_be_bytes());
             tls_record.extend_from_slice(data);
-            
+
             self.tls_sequence += 1;
             Ok(tls_record)
         } else {
@@ -505,7 +505,7 @@ impl RigbyClientConnection {
             let short_id = opts.reality_short_id.unwrap_or_else(|| vec![0u8; 8]);
             let mut reality = RealityConfig::new(pub_key, short_id)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-            
+
             if let Some(fingerprint_name) = &opts.client_fingerprint {
                 let fingerprint = ClientFingerprint::from_name(fingerprint_name)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
@@ -534,7 +534,7 @@ impl RigbyClientConnection {
         let hs_len = hs
             .write_message(&hs_payload, &mut hs_msg)
             .map_err(|e| io::Error::other(e.to_string()))?;
-        
+
         // Wrap handshake message as TLS record if Reality is enabled
         let wrapped_hs = reality_transport.wrap_as_tls_record(&hs_msg[..hs_len])?;
         debug!("rigby: sending handshake {} bytes (wrapped: {})", hs_len, wrapped_hs.len());
@@ -558,7 +558,7 @@ impl RigbyClientConnection {
         debug!("rigby: received handshake response {} bytes", response.data.len());
         // Unwrap TLS record to get raw handshake response
         let unwrapped_response = reality_transport.unwrap_tls_record(&response.data)?;
-        
+
         debug!("rigby: unwrapped response {} bytes", unwrapped_response.len());
         let mut hs_buf = vec![0u8; 2048];
         hs.read_message(&unwrapped_response, &mut hs_buf)
@@ -614,11 +614,11 @@ impl RigbyClientConnection {
                         }
                     }
                     maybe_pkt = stream.next() => {
-                        let Some(pkt) = maybe_pkt else { 
+                        let Some(pkt) = maybe_pkt else {
                             debug!("rigby: stream ended");
-                            break 
+                            break
                         };
-                        
+
                         debug!("rigby: received packet {} bytes", pkt.data.len());
                         // Unwrap TLS record first
                         let unwrapped_data = {
@@ -628,7 +628,7 @@ impl RigbyClientConnection {
                                 Err(_) => continue,
                             }
                         };
-                        
+
                         let decoded = match decrypt_packet(&mut transport, &unwrapped_data) {
                             Ok(v) => v,
                             Err(_) => continue,
@@ -1118,13 +1118,13 @@ where
     let n = transport
         .write_message(&plain, &mut encrypted)
         .map_err(|e| io::Error::other(e.to_string()))?;
-    
+
     // Wrap encrypted data as TLS record
     let wrapped_data = {
         let mut reality = reality_transport.lock().await;
         reality.wrap_as_tls_record(&encrypted[..n])?
     };
-    
+
     if !wrapped_data.is_empty() {
         sink.send(UdpPacket::new(
             wrapped_data,
@@ -1145,6 +1145,7 @@ async fn send_encrypted_to_socket(
     recv_window: &RecvWindow,
     frame: &OutgoingFrame,
     padding: bool,
+    is_reality: bool,
 ) -> io::Result<()> {
     let (ack, ack_bits) = recv_window.ack_tuple();
     let plain = encode_plain_packet(*send_seq, ack, ack_bits, frame, padding)?;
@@ -1155,6 +1156,18 @@ async fn send_encrypted_to_socket(
         .write_message(&plain, &mut encrypted)
         .map_err(|e| io::Error::other(e.to_string()))?;
 
+    let mut final_payload = &encrypted[..n];
+    let mut wrapped = Vec::new();
+
+    if is_reality {
+        wrapped.reserve(5 + n);
+        wrapped.push(0x17); // Content Type: Application Data
+        wrapped.extend_from_slice(&[0x03, 0x04]); // TLS 1.3
+        wrapped.extend_from_slice(&(n as u16).to_be_bytes());
+        wrapped.extend_from_slice(&encrypted[..n]);
+        final_payload = &wrapped;
+    }
+
     let dst = match destination {
         SocksAddr::Ip(ip) => *ip,
         SocksAddr::Domain(_, _) => {
@@ -1163,7 +1176,7 @@ async fn send_encrypted_to_socket(
             ));
         }
     };
-    socket.send_to(&encrypted[..n], dst).await?;
+    socket.send_to(final_payload, dst).await?;
     Ok(())
 }
 
@@ -1206,7 +1219,16 @@ impl RigbyServer {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    let incoming = &recv_buf[..n];
+                    let mut incoming = &recv_buf[..n];
+
+                    let mut is_reality_packet = false;
+                    if incoming.len() > 5 && incoming[0] == 0x17 && incoming[1] == 0x03 && incoming[2] == 0x04 {
+                        let payload_len = u16::from_be_bytes([incoming[3], incoming[4]]) as usize;
+                        if incoming.len() >= 5 + payload_len {
+                            incoming = &incoming[5..5 + payload_len];
+                            is_reality_packet = true;
+                        }
+                    }
 
                     if let Some(peer) = peers.get_mut(&addr) {
                         let decoded = match decrypt_packet(&mut peer.transport, incoming) {
@@ -1319,13 +1341,26 @@ impl RigbyServer {
                         continue;
                     };
 
-                    let _ = socket.send_to(&response, addr).await;
+                    let mut final_response = response;
+                    if is_reality_packet {
+                        let n = final_response.len();
+                        let mut wrapped = Vec::with_capacity(5 + n);
+                        wrapped.push(0x17);
+                        wrapped.extend_from_slice(&[0x03, 0x04]);
+                        wrapped.extend_from_slice(&(n as u16).to_be_bytes());
+                        wrapped.extend_from_slice(&final_response);
+                        final_response = wrapped;
+                    }
+
+                    let _ = socket.send_to(&final_response, addr).await;
+
                     peers.insert(addr, ServerPeer {
                         transport,
                         send_seq: 1,
                         recv_window: RecvWindow::default(),
                         streams: HashMap::new(),
                         last_seen: Instant::now(),
+                        is_reality: is_reality_packet,
                     });
                 }
                 Some(to_send) = outgoing_rx.recv() => {
@@ -1339,6 +1374,7 @@ impl RigbyServer {
                         &peer.recv_window,
                         &to_send.frame,
                         self.cfg.padding,
+                        peer.is_reality,
                     )
                     .await
                     .is_err()
@@ -1362,6 +1398,7 @@ struct ServerPeer {
     recv_window: RecvWindow,
     streams: HashMap<u16, mpsc::Sender<Vec<u8>>>,
     last_seen: Instant,
+    is_reality: bool,
 }
 
 struct ServerOutbound {
