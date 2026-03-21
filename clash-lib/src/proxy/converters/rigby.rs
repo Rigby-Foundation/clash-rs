@@ -42,14 +42,19 @@ impl TryFrom<OutboundRigby> for Handler {
         tracing::error!("🐛 RIGBY CONVERTER: Attempting to create handler for {}", value.common_opts.name);
         tracing::error!("🐛 RIGBY CONVERTER: Server={}:{}, has_reality={}", 
             value.common_opts.server, value.common_opts.port, value.reality_public_key.is_some());
+        
+        tracing::error!("🐛 RIGBY CONVERTER: Step 1 - Decoding server static pubkey");
         let server_static_pubkey =
             decode_key32(&value.server_static_pubkey, "rigby server-static-pubkey")?;
+        
+        tracing::error!("🐛 RIGBY CONVERTER: Step 2 - Decoding client private key");
         let client_private_key = value
             .client_private_key
             .as_deref()
             .map(|v| decode_key32(v, "rigby client-private-key"))
             .transpose()?;
         
+        tracing::error!("🐛 RIGBY CONVERTER: Step 3 - Decoding reality public key");
         // Parse Reality public key if provided
         let reality_public_key = value
             .reality_public_key
@@ -57,6 +62,7 @@ impl TryFrom<OutboundRigby> for Handler {
             .map(|v| decode_key32(v, "rigby reality-public-key"))
             .transpose()?;
         
+        tracing::error!("🐛 RIGBY CONVERTER: Step 4 - Decoding reality short ID");
         // Parse Reality short ID if provided
         let reality_short_id = value
             .reality_short_id
@@ -65,6 +71,7 @@ impl TryFrom<OutboundRigby> for Handler {
                 Error::InvalidConfig("rigby reality-short-id must be hex string".to_string())))
             .transpose()?;
 
+        tracing::error!("🐛 RIGBY CONVERTER: Step 5 - Creating handler");
         Ok(Handler::new(HandlerOptions {
             name: value.common_opts.name.clone(),
             common_opts: HandlerCommonOptions {
@@ -83,6 +90,8 @@ impl TryFrom<OutboundRigby> for Handler {
             reality_short_id,
             client_fingerprint: value.client_fingerprint,
             alpn: value.alpn,
-        }))
+        }));
+        tracing::error!("🐛 RIGBY CONVERTER: SUCCESS - Handler created!");
+        Ok(handler)
     }
 }
