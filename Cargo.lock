@@ -868,7 +868,7 @@ dependencies = [
  "parking_lot",
  "portable-atomic",
  "rand_core 0.6.4",
- "ring",
+ "ring 0.17.14",
  "tracing",
  "x25519-dalek",
 ]
@@ -3285,7 +3285,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rand 0.9.2",
- "ring",
+ "ring 0.17.14",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -3953,7 +3953,7 @@ dependencies = [
  "identity-hash",
  "lru-slab",
  "rand 0.9.2",
- "ring",
+ "ring 0.17.14",
  "rustc-hash 2.1.1",
  "rustls",
  "rustls-pki-types",
@@ -5861,7 +5861,7 @@ dependencies = [
  "getrandom 0.3.3",
  "lru-slab",
  "rand 0.9.2",
- "ring",
+ "ring 0.17.14",
  "rustc-hash 2.1.1",
  "rustls",
  "rustls-pki-types",
@@ -5882,7 +5882,7 @@ dependencies = [
  "bytes",
  "getrandom 0.3.3",
  "rand 0.9.2",
- "ring",
+ "ring 0.17.14",
  "rustc-hash 2.1.1",
  "rustls-jls",
  "rustls-pki-types",
@@ -6056,12 +6056,23 @@ dependencies = [
 
 [[package]]
 name = "rcgen"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52c4f3084aa3bc7dfbba4eff4fab2a54db4324965d8872ab933565e6fbd83bc6"
+dependencies = [
+ "pem",
+ "ring 0.16.20",
+ "time",
+ "yasna",
+]
+
+[[package]]
+name = "rcgen"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c83367ba62b3f1dbd0f086ede4e5ebfb4713fb234dbbc5807772a31245ff46d"
 dependencies = [
- "pem",
- "ring",
+ "ring 0.17.14",
  "rustls-pki-types",
  "time",
  "yasna",
@@ -6226,7 +6237,7 @@ dependencies = [
  "hex",
  "quinn",
  "rand 0.8.5",
- "rcgen",
+ "rcgen 0.11.3",
  "rustls",
  "serde",
  "serde_yaml",
@@ -6234,6 +6245,21 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "x25519-dalek",
+]
+
+[[package]]
+name = "ring"
+version = "0.16.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3053cf52e236a3ed746dfc745aa9cacf1b791d846bdaf412f60a8d7d6e17c8fc"
+dependencies = [
+ "cc",
+ "libc",
+ "once_cell",
+ "spin 0.5.2",
+ "untrusted 0.7.1",
+ "web-sys",
+ "winapi",
 ]
 
 [[package]]
@@ -6265,7 +6291,7 @@ dependencies = [
  "p384",
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
- "ring",
+ "ring 0.17.14",
  "signature 2.2.0",
 ]
 
@@ -6400,7 +6426,7 @@ dependencies = [
  "pkcs8 0.10.2",
  "rand 0.8.5",
  "rand_core 0.6.4",
- "ring",
+ "ring 0.17.14",
  "russh-cryptovec",
  "russh-util",
  "sec1",
@@ -6499,7 +6525,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
- "ring",
+ "ring 0.17.14",
  "rustls-pki-types",
  "rustls-webpki 0.103.5",
  "subtle",
@@ -6514,7 +6540,7 @@ checksum = "0b733b38ea6938845bac18a47c527c84355331ea6f641a652fe320b324889238"
 dependencies = [
  "aes-gcm",
  "once_cell",
- "ring",
+ "ring 0.17.14",
  "rustls-pki-types",
  "rustls-webpki 0.103.5",
  "subtle",
@@ -6586,7 +6612,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
 dependencies = [
  "aws-lc-rs",
- "ring",
+ "ring 0.17.14",
  "rustls-pki-types",
  "untrusted 0.9.0",
 ]
@@ -6598,7 +6624,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5a37813727b78798e53c2bec3f5e8fe12a6d6f8389bf9ca7802add4c9905ad8"
 dependencies = [
  "aws-lc-rs",
- "ring",
+ "ring 0.17.14",
  "rustls-pki-types",
  "untrusted 0.9.0",
 ]
@@ -7205,8 +7231,8 @@ dependencies = [
  "iroh-quinn",
  "notify",
  "quinn-jls",
- "rcgen",
- "ring",
+ "rcgen 0.14.4",
+ "ring 0.17.14",
  "rustls",
  "rustls-jls",
  "rustls-native-certs",
@@ -7515,6 +7541,12 @@ name = "sorted-index-buffer"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea06cc588e43c632923a55450401b8f25e628131571d4e1baea1bdfdb2b5ed06"
+
+[[package]]
+name = "spin"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e63cff320ae2c57904679ba7cb63280a3dc4613885beafb148ee7bf9aa9042d"
 
 [[package]]
 name = "spin"
@@ -10014,7 +10046,7 @@ source = "git+https://github.com/Rigby-Foundation/rustls.git?rev=c35db86fc4264d0
 dependencies = [
  "aws-lc-rs",
  "once_cell",
- "ring",
+ "ring 0.17.14",
  "rustls-pki-types",
  "rustls-webpki 0.102.8",
  "subtle",

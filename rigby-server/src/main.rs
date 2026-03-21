@@ -19,6 +19,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
 
     let cert = rcgen::generate_simple_self_signed(vec![args.sni.clone()])?;
