@@ -89,7 +89,6 @@ struct RigbyRealityTransport {
     reality_client: Option<ClientConnection>,
     tls_sequence: u64,
     handshake_done: bool,
-    pending_cleartext: Vec<u8>,
 }
 
 impl RigbyRealityTransport {
@@ -115,7 +114,6 @@ impl RigbyRealityTransport {
             reality_client,
             tls_sequence: 0,
             handshake_done: false,
-            pending_cleartext: Vec::new(),
         })
     }
 
@@ -123,10 +121,9 @@ impl RigbyRealityTransport {
     fn wrap_as_tls_record(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
         if let Some(ref mut client) = self.reality_client {
             if !self.handshake_done {
-                // During handshake, Reality handles the wrapping
-                // Store cleartext for later, but still send the handshake data
-                self.pending_cleartext.extend_from_slice(data);
-                return Ok(data.to_vec()); // Send handshake data directly
+                // During handshake, send data directly without TLS wrapping
+                // Reality TLS wrapping happens after handshake completes
+                return Ok(data.to_vec());
             }
 
             // Post-handshake: wrap as TLS Application Data
@@ -173,9 +170,8 @@ impl RigbyRealityTransport {
         }
     }
 
-    fn mark_handshake_done(&mut self) -> Vec<u8> {
+    fn mark_handshake_done(&mut self) {
         self.handshake_done = true;
-        std::mem::take(&mut self.pending_cleartext)
     }
 }
 
@@ -566,12 +562,8 @@ impl RigbyClientConnection {
             .into_transport_mode()
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        // Mark handshake done and send any pending cleartext
-        let pending_data = reality_transport.mark_handshake_done();
-        if !pending_data.is_empty() {
-            warn!("rigby: sending {} bytes of pending cleartext after handshake", pending_data.len());
-            // TODO: Send pending data
-        }
+        // Mark handshake done
+        reality_transport.mark_handshake_done();
 
         let streams: Arc<RwLock<HashMap<u16, mpsc::Sender<Vec<u8>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
