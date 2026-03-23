@@ -23,11 +23,12 @@ fn init_roots() -> Arc<RootCertStore> {
 pub struct Client(Arc<ClientInner>);
 
 impl Client {
-    pub fn new(sni: String, public_key: [u8; 32], short_id: Vec<u8>) -> Self {
+    pub fn new(sni: String, public_key: [u8; 32], short_id: Vec<u8>, fingerprint: Option<String>) -> Self {
         Self(Arc::new(ClientInner {
             sni,
             public_key,
             short_id,
+            fingerprint,
             roots: OnceLock::new(),
         }))
     }
@@ -49,10 +50,17 @@ impl Client {
         &self,
         stream: AnyStream,
     ) -> io::Result<TlsStream<AnyStream>> {
-        let reality = RealityConfig::new(self.public_key, self.short_id.clone())
+        let mut reality = RealityConfig::new(self.public_key, self.short_id.clone())
             .map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
             })?;
+
+        if let Some(fp_name) = &self.fingerprint {
+            match watfaq_rustls::client::reality::ClientFingerprint::from_name(fp_name) {
+                Ok(fp) => reality = reality.with_client_fingerprint(fp),
+                Err(e) => tracing::warn!("invalid utls fingerprint: {e}"),
+            }
+        }
 
         let tls_config = ClientConfig::builder()
             .with_root_certificates(self.roots.get_or_init(init_roots).clone())
@@ -144,6 +152,7 @@ pub struct ClientInner {
     sni: String,
     public_key: [u8; 32],
     short_id: Vec<u8>,
+    fingerprint: Option<String>,
     // cached for performance
     roots: OnceLock<Arc<RootCertStore>>,
 }
@@ -159,7 +168,7 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let c = Client::new("example.com".to_string(), [1u8; 32], vec![0xab, 0xcd]);
+        let c = Client::new("example.com".to_string(), [1u8; 32], vec![0xab, 0xcd], None);
         assert_eq!(c.sni, "example.com");
         assert_eq!(c.public_key, [1u8; 32]);
         assert_eq!(c.short_id, vec![0xab, 0xcd]);
@@ -168,7 +177,7 @@ mod tests {
     // short_id > 8 bytes → RealityConfig::new() fails → InvalidInput
     #[tokio::test]
     async fn test_short_id_too_long() {
-        let c = Client::new("example.com".to_string(), [0u8; 32], vec![0u8; 9]);
+        let c = Client::new("example.com".to_string(), [0u8; 32], vec![0u8; 9], None);
         let err = c.proxy_stream(make_stream()).await.err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
@@ -176,7 +185,7 @@ mod tests {
     // Invalid SNI → ServerName::try_from fails → InvalidInput
     #[tokio::test]
     async fn test_invalid_sni() {
-        let c = Client::new("".to_string(), [0u8; 32], vec![0u8; 4]);
+        let c = Client::new("".to_string(), [0u8; 32], vec![0u8; 4], None);
         let err = c.proxy_stream(make_stream()).await.err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
@@ -184,7 +193,7 @@ mod tests {
     // Valid params, server side dropped → TLS handshake error (not InvalidInput)
     #[tokio::test]
     async fn test_handshake_error_on_closed_peer() {
-        let c = Client::new("example.com".to_string(), [0u8; 32], vec![0u8; 4]);
+        let c = Client::new("example.com".to_string(), [0u8; 32], vec![0u8; 4], None);
         let err = c.proxy_stream(make_stream()).await.err().unwrap();
         assert_ne!(err.kind(), io::ErrorKind::InvalidInput);
     }

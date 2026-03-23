@@ -31,13 +31,6 @@ impl TryFrom<&OutboundVless> for Handler {
             );
         }
 
-        if s.client_fingerprint.is_some() {
-            warn!(
-                "client-fingerprint (uTLS) is not yet implemented, ignored for {}",
-                s.common_opts.name
-            );
-        }
-
         let tls: Option<Box<dyn Transport>> = if let Some(ref reality_opts) =
             s.reality_opts
         {
@@ -56,7 +49,7 @@ impl TryFrom<&OutboundVless> for Handler {
                 .clone()
                 .unwrap_or_else(|| s.common_opts.server.clone());
 
-            Some(Box::new(RealityClient::new(sni, pk_bytes, short_id)))
+            Some(Box::new(RealityClient::new(sni, pk_bytes, short_id, s.client_fingerprint.clone())))
         } else {
             // vless without reality
             match s.tls.unwrap_or_default() {

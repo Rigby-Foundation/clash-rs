@@ -6495,7 +6495,7 @@ dependencies = [
  "pkcs8 0.10.2",
  "rand 0.8.5",
  "rand_core 0.6.4",
- "ring",
+ "ring 0.17.14",
  "rsa 0.10.0-rc.12",
  "russh-cryptovec",
  "russh-util",
