@@ -33,3 +33,6 @@ warnings = "allow"
 [workspace.lints.clippy]
 redundant_clone = "deny"
 needless_collect = "deny"
+
+[patch."https://github.com/Watfaq/rustls.git"]
+watfaq-rustls = { git = "https://github.com/Rigby-Foundation/rustls.git", branch = "utls-0.23" }

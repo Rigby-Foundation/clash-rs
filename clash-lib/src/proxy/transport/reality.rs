@@ -57,10 +57,17 @@ impl Client {
 
         if let Some(fp_name) = &self.fingerprint {
             match watfaq_rustls::client::reality::ClientFingerprint::from_name(fp_name) {
-                Ok(fp) => reality = reality.with_client_fingerprint(fp),
+                Ok(fp) => {
+                    tracing::info!("Reality: applying uTLS fingerprint: {:?}", fp);
+                    reality = reality.with_client_fingerprint(fp);
+                }
                 Err(e) => tracing::warn!("invalid utls fingerprint: {e}"),
             }
+        } else {
+            tracing::info!("Reality: no client-fingerprint configured, using default (Chrome)");
         }
+
+        tracing::info!("Reality: connecting to SNI={}, short_id_len={}", self.sni, self.short_id.len());
 
         let tls_config = ClientConfig::builder()
             .with_root_certificates(self.roots.get_or_init(init_roots).clone())
