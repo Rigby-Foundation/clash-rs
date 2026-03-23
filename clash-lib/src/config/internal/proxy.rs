@@ -235,6 +235,13 @@ pub struct GrpcOpt {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
+pub struct RealityOpt {
+    pub public_key: String,
+    pub short_id: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
 pub struct OutboundTrojan {
     #[serde(flatten)]
     pub common_opts: CommonConfigOptions,
@@ -268,12 +275,6 @@ pub struct OutboundVmess {
     pub grpc_opts: Option<GrpcOpt>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
-#[serde(rename_all = "kebab-case")]
-pub struct RealityOpt {
-    pub public_key: String,
-    pub short_id: String,
-}
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -309,6 +310,11 @@ pub struct OutboundRigby {
     pub mux: bool,
     #[serde(default = "default_bool_true")]
     pub udp: bool,
+    // Reality steganography options
+    pub reality_public_key: Option<String>,
+    pub reality_short_id: Option<String>,
+    pub client_fingerprint: Option<String>,
+    pub alpn: Option<Vec<String>>,
 }
 
 #[cfg(feature = "wireguard")]

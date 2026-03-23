@@ -868,7 +868,7 @@ dependencies = [
  "parking_lot",
  "portable-atomic",
  "rand_core 0.6.4",
- "ring",
+ "ring 0.17.14",
  "tracing",
  "x25519-dalek",
 ]
@@ -1308,7 +1308,7 @@ dependencies = [
  "uuid",
  "watfaq-dns",
  "watfaq-netstack",
- "watfaq-rustls 0.23.21 (git+https://github.com/Rigby-Foundation/rustls.git?rev=c35db86fc4264d0ad54ca44cafe5995fec513144)",
+ "watfaq-rustls",
  "webpki-roots",
  "windows 0.62.2",
  "zstd",
@@ -2553,6 +2553,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "fastbloom"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7f34442dbe69c60fe8eaf58a8cafff81a1f278816d8ab4db255b3bef4ac3c4"
+dependencies = [
+ "getrandom 0.3.3",
+ "libm",
+ "rand 0.9.2",
+ "siphasher",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3276,7 +3288,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rand 0.9.2",
- "ring",
+ "ring 0.17.14",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -3947,7 +3959,7 @@ dependencies = [
  "identity-hash",
  "lru-slab",
  "rand 0.9.2",
- "ring",
+ "ring 0.17.14",
  "rustc-hash 2.1.1",
  "rustls",
  "rustls-pki-types",
@@ -5265,6 +5277,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pem"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
+dependencies = [
+ "base64 0.22.1",
+ "serde_core",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5842,13 +5864,15 @@ checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
  "aws-lc-rs",
  "bytes",
+ "fastbloom",
  "getrandom 0.3.3",
  "lru-slab",
  "rand 0.9.2",
- "ring",
+ "ring 0.17.14",
  "rustc-hash 2.1.1",
  "rustls",
  "rustls-pki-types",
+ "rustls-platform-verifier",
  "slab",
  "thiserror 2.0.18",
  "tinyvec",
@@ -5865,7 +5889,7 @@ dependencies = [
  "bytes",
  "getrandom 0.3.3",
  "rand 0.9.2",
- "ring",
+ "ring 0.17.14",
  "rustc-hash 2.1.1",
  "rustls-jls",
  "rustls-pki-types",
@@ -6039,11 +6063,23 @@ dependencies = [
 
 [[package]]
 name = "rcgen"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52c4f3084aa3bc7dfbba4eff4fab2a54db4324965d8872ab933565e6fbd83bc6"
+dependencies = [
+ "pem",
+ "ring 0.16.20",
+ "time",
+ "yasna",
+]
+
+[[package]]
+name = "rcgen"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c83367ba62b3f1dbd0f086ede4e5ebfb4713fb234dbbc5807772a31245ff46d"
 dependencies = [
- "ring",
+ "ring 0.17.14",
  "rustls-pki-types",
  "time",
  "yasna",
@@ -6237,6 +6273,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigby-server"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "clash-lib",
+ "hex",
+ "quinn",
+ "rand 0.8.5",
+ "rcgen 0.11.3",
+ "rustls",
+ "serde",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "ring"
+version = "0.16.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3053cf52e236a3ed746dfc745aa9cacf1b791d846bdaf412f60a8d7d6e17c8fc"
+dependencies = [
+ "cc",
+ "libc",
+ "once_cell",
+ "spin 0.5.2",
+ "untrusted 0.7.1",
+ "web-sys",
+ "winapi",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6265,7 +6336,7 @@ dependencies = [
  "p384",
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
- "ring",
+ "ring 0.17.14",
  "signature 2.2.0",
 ]
 
@@ -6502,7 +6573,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
- "ring",
+ "ring 0.17.14",
  "rustls-pki-types",
  "rustls-webpki 0.103.5",
  "subtle",
@@ -6517,7 +6588,7 @@ checksum = "0b733b38ea6938845bac18a47c527c84355331ea6f641a652fe320b324889238"
 dependencies = [
  "aes-gcm",
  "once_cell",
- "ring",
+ "ring 0.17.14",
  "rustls-pki-types",
  "rustls-webpki 0.103.5",
  "subtle",
@@ -6589,7 +6660,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
 dependencies = [
  "aws-lc-rs",
- "ring",
+ "ring 0.17.14",
  "rustls-pki-types",
  "untrusted 0.9.0",
 ]
@@ -6601,7 +6672,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5a37813727b78798e53c2bec3f5e8fe12a6d6f8389bf9ca7802add4c9905ad8"
 dependencies = [
  "aws-lc-rs",
- "ring",
+ "ring 0.17.14",
  "rustls-pki-types",
  "untrusted 0.9.0",
 ]
@@ -7208,8 +7279,8 @@ dependencies = [
  "iroh-quinn",
  "notify",
  "quinn-jls",
- "rcgen",
- "ring",
+ "rcgen 0.14.4",
+ "ring 0.17.14",
  "rustls",
  "rustls-jls",
  "rustls-native-certs",
@@ -7518,6 +7589,12 @@ name = "sorted-index-buffer"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea06cc588e43c632923a55450401b8f25e628131571d4e1baea1bdfdb2b5ed06"
+
+[[package]]
+name = "spin"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e63cff320ae2c57904679ba7cb63280a3dc4613885beafb148ee7bf9aa9042d"
 
 [[package]]
 name = "spin"
@@ -8157,11 +8234,11 @@ dependencies = [
 [[package]]
 name = "tokio-watfaq-rustls"
 version = "0.26.0"
-source = "git+https://github.com/Watfaq/tokio-rustls.git?rev=638db32084d7ecf9c2660847b55d48d1186b4055#638db32084d7ecf9c2660847b55d48d1186b4055"
+source = "git+https://github.com/Watfaq/tokio-rustls.git?rev=cf8961ac1a36e580d0e38bedc8a41ca4a9b301e8#cf8961ac1a36e580d0e38bedc8a41ca4a9b301e8"
 dependencies = [
  "rustls-pki-types",
  "tokio",
- "watfaq-rustls 0.23.21 (git+https://github.com/Watfaq/rustls.git?rev=4cae3aa2e84ea29d8a74b495793773bdb0a72206)",
+ "watfaq-rustls",
 ]
 
 [[package]]
@@ -10046,27 +10123,16 @@ dependencies = [
 [[package]]
 name = "watfaq-rustls"
 version = "0.23.21"
-source = "git+https://github.com/Watfaq/rustls.git?rev=4cae3aa2e84ea29d8a74b495793773bdb0a72206#4cae3aa2e84ea29d8a74b495793773bdb0a72206"
-dependencies = [
- "log",
- "once_cell",
- "rustls-pki-types",
- "rustls-webpki 0.102.8",
- "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "watfaq-rustls"
-version = "0.23.21"
-source = "git+https://github.com/Rigby-Foundation/rustls.git?rev=c35db86fc4264d0ad54ca44cafe5995fec513144#c35db86fc4264d0ad54ca44cafe5995fec513144"
+source = "git+https://github.com/Watfaq/rustls.git?rev=c3ab043d673029d245fd618b9bc86fd6a6109bae#c3ab043d673029d245fd618b9bc86fd6a6109bae"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
- "ring",
+ "ring 0.17.14",
  "rustls-pki-types",
  "rustls-webpki 0.102.8",
  "subtle",
+ "x25519-dalek",
  "zeroize",
 ]
 

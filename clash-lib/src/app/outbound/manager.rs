@@ -313,6 +313,9 @@ impl OutboundManager {
                 }
                 OutboundProxyProtocol::Rigby(r) => {
                     let name = r.common_opts.name.clone();
+                    tracing::info!("🐛 Attempting to create rigby outbound: {}", name);
+                    tracing::info!("🐛 Rigby config: server={}, port={}, has_reality={}",
+                        r.common_opts.server, r.common_opts.port, r.reality_public_key.is_some());
                     r.try_into()
                         .map(|x: rigby::Handler| Arc::new(x) as _)
                         .inspect_err(|e| {

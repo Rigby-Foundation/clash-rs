@@ -1,4 +1,4 @@
-use self::stream::{VisionStream, VlessStream};
+use self::{stream::VlessStream, vision::VisionStream};
 use super::{
     AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
     OutboundHandler, OutboundType,
@@ -18,11 +18,13 @@ use crate::{
     session::Session,
 };
 use async_trait::async_trait;
-use std::{io, sync::Arc};
+use erased_serde::Serialize as ErasedSerialize;
+use std::{collections::HashMap, io, sync::Arc};
 use tracing::debug;
 
 mod datagram;
 mod stream;
+mod vision;
 
 pub struct HandlerOptions {
     pub name: String,
@@ -65,10 +67,10 @@ impl Handler {
         sess: &Session,
         is_udp: bool,
     ) -> io::Result<AnyStream> {
-        let s = if let Some(tls) = self.opts.tls.as_ref() {
-            tls.proxy_stream(s).await?
+        let (s, vision_opts) = if let Some(tls) = self.opts.tls.as_ref() {
+            tls.proxy_stream_spliced(s).await?
         } else {
-            s
+            (s, None)
         };
 
         let s = if let Some(transport) = self.opts.transport.as_ref() {
@@ -85,11 +87,12 @@ impl Handler {
             self.opts.flow.clone(),
         )?;
 
-        if matches!(
-            self.opts.flow.as_deref(),
-            Some("xtls-rprx-vision" | "xtls-rprx-vision-udp443")
-        ) {
-            Ok(Box::new(VisionStream::new(vless_stream)))
+        if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
+            Ok(Box::new(VisionStream::new(
+                Box::new(vless_stream),
+                self.opts.uuid.clone(),
+                vision_opts,
+            )?))
         } else {
             Ok(Box::new(vless_stream))
         }
@@ -205,8 +208,11 @@ impl OutboundHandler for Handler {
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }
+
+
 }
 
+#[async_trait]
 #[cfg(all(test, docker_test))]
 mod tests {
     use std::collections::HashMap;
