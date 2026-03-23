@@ -275,12 +275,6 @@ pub struct OutboundVmess {
     pub grpc_opts: Option<GrpcOpt>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
-#[serde(rename_all = "kebab-case")]
-pub struct RealityOpt {
-    pub public_key: String,
-    pub short_id: String,
-}
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]

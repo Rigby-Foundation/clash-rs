@@ -4,7 +4,7 @@ mod reality;
 mod shadow_tls;
 mod simple_obfs;
 mod sip003;
-pub mod splice_tls;
+mod splice_tls;
 mod tls;
 mod v2ray;
 mod ws;
