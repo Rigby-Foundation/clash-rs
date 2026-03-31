@@ -10151,7 +10151,7 @@ dependencies = [
 [[package]]
 name = "watfaq-rustls"
 version = "0.23.21"
-source = "git+https://github.com/Rigby-Foundation/rustls.git?branch=utls-0.23#c35db86fc4264d0ad54ca44cafe5995fec513144"
+source = "git+https://github.com/Rigby-Foundation/rustls.git?branch=utls-0.23#931488b021bf789a2d03372e1815e951b3b6684c"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -10160,6 +10160,7 @@ dependencies = [
  "rustls-pki-types",
  "rustls-webpki 0.102.8",
  "subtle",
+ "x25519-dalek",
  "zeroize",
 ]
 
